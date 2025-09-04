@@ -27,6 +27,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\DirectXTextWrapper\DirectXTexWrapper.vcxproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Compile Update="My Project\Application.Designer.vb">
       <DesignTime>True</DesignTime>
       <AutoGen>True</AutoGen>
