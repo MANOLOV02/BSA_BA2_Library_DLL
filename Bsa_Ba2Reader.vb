@@ -30,6 +30,31 @@ Namespace BethesdaArchive.Core
             Return _impl.ExtractByIndex(index)
         End Function
 
+        ''' <summary>
+        ''' Returns the raw compressed payload of an entry without decompressing it. Intended for
+        ''' stream-copy scenarios (e.g. WM Pack incremental rewrite reusing unchanged entries from
+        ''' a previous archive). Throws NotSupportedException if the source entry has a layout the
+        ''' caller cannot replay verbatim (e.g. multi-chunk BA2, non-default tile mode).
+        ''' </summary>
+        Public Function ExtractCompressedPayload(index As Integer) As RawCompressedEntry
+            If index < 0 OrElse index >= _entries.Count Then Throw New ArgumentOutOfRangeException(NameOf(index))
+            Return _impl.ExtractRawByIndex(index)
+        End Function
+
+        ''' <summary>
+        ''' Builds a PayloadStreamSource pointing at this reader's underlying stream, so a writer
+        ''' can stream-copy the entry's payload bytes without buffering them in a managed array.
+        ''' For BA2 entries this is metadata-only (no I/O). For BSA compressed entries it reads
+        ''' the 4-byte u32 decompSize prefix from disk (single tiny read per entry).
+        ''' The returned source is valid only while THIS BethesdaReader's stream stays open and
+        ''' un-seeked by other operations. The writer that consumes it is responsible for
+        ''' sequencing reads (one entry at a time).
+        ''' </summary>
+        Public Function GetPayloadSource(index As Integer) As PayloadStreamSource
+            If index < 0 OrElse index >= _entries.Count Then Throw New ArgumentOutOfRangeException(NameOf(index))
+            Return _impl.GetPayloadSourceByIndex(index)
+        End Function
+
         Private Shared Function DetectAndOpen(fs As Stream, enc As Encoding) As IArchiveImpl
             If Not fs.CanSeek Then Throw New ArgumentException("El Stream debe soportar Seek")
             Dim start = fs.Position
@@ -59,6 +84,14 @@ Namespace BethesdaArchive.Core
         Public Property Index As Integer
         Public Property Directory As String
         Public Property FileName As String
+        ' Total decompressed payload size, populated from data already parsed during Open() —
+        ' no extra I/O. Semantics:
+        '   - BA2 GNRL/DX10: sum of chunk DecompressedSize fields (always known).
+        '   - BSA non-compressed: deduced from sizeField minus the BSTRING overhead.
+        '   - BSA compressed: NOT KNOWN here (the per-entry u32 decompSize lives at the start
+        '     of the payload, which Open() doesn't read). Reported as 0 in that case; callers
+        '     that need an exact number must call ExtractCompressedPayload or ExtractToMemory.
+        Public Property DecompressedSize As Long
         Public ReadOnly Property FullPath As String
             Get
                 If String.IsNullOrEmpty(Directory) Then Return FileName
@@ -71,6 +104,8 @@ Namespace BethesdaArchive.Core
         Inherits IDisposable
         Function ListEntries() As List(Of ArchiveEntry)
         Function ExtractByIndex(index As Integer) As Byte()
+        Function ExtractRawByIndex(index As Integer) As RawCompressedEntry
+        Function GetPayloadSourceByIndex(index As Integer) As PayloadStreamSource
     End Interface
 
     ' ============ DECOMPRESSERS =============
@@ -401,7 +436,27 @@ Namespace BethesdaArchive.Core
         Public Function ListEntries() As List(Of ArchiveEntry) Implements IArchiveImpl.ListEntries
             Dim list As New List(Of ArchiveEntry)(_records.Count)
             For Each r In _records
-                list.Add(New ArchiveEntry With {.Index = r.Index, .Directory = r.Directory, .FileName = r.FileName})
+                Dim decomp As Long = 0
+                If Not r.Compressed Then
+                    ' Non-compressed entry: payload size = sizeField (low 30 bits) minus the
+                    ' embedded BSTRING (1 byte length + dir + '\' + filename) when applicable.
+                    Dim sizeWork As Long = CLng(r.SizeField And &H3FFFFFFFUI)
+                    Dim bstringOverhead As Long = 0
+                    If r.HasEmbeddedName Then
+                        Dim dirBytes As Long = If(r.Directory Is Nothing, 0L, CLng(_enc.GetByteCount(r.Directory.Trim(Correct_Path_separator, InCorrect_Path_separator))))
+                        Dim fileBytes As Long = If(r.FileName Is Nothing, 0L, CLng(_enc.GetByteCount(r.FileName)))
+                        bstringOverhead = 1 + dirBytes + 1 + fileBytes
+                    End If
+                    decomp = Math.Max(0L, sizeWork - bstringOverhead)
+                End If
+                ' For compressed entries the u32 decompSize is at the start of the payload and is
+                ' NOT parsed here (would require per-entry I/O). Reporting 0 = unknown.
+                list.Add(New ArchiveEntry With {
+                    .Index = r.Index,
+                    .Directory = r.Directory,
+                    .FileName = r.FileName,
+                    .DecompressedSize = decomp
+                })
             Next
             Return list
         End Function
@@ -458,7 +513,98 @@ Namespace BethesdaArchive.Core
             Return outData
         End Function
 
+        Public Function ExtractRawByIndex(index As Integer) As RawCompressedEntry Implements IArchiveImpl.ExtractRawByIndex
+            Dim r = _records(index)
 
+            ' Same skipping logic as ExtractByIndex up to the point where we'd decompress: we want
+            ' the post-BSTRING / post-decompSize payload bytes verbatim.
+            Dim offPhys As UInteger = (r.Offset And &H7FFFFFFFUI)
+            _fs.Position = CLng(offPhys)
+
+            Dim sizeWork As UInteger = (r.SizeField And &H3FFFFFFFUI)
+
+            If r.HasEmbeddedName Then
+                Dim nameLen As Integer = _fs.ReadByte()
+                If nameLen < 0 Then Throw New EndOfStreamException("BSA: EOF leyendo longitud de nombre embebido.")
+                If _fs.Position + nameLen > _fs.Length Then
+                    Throw New EndOfStreamException("BSA: nombre embebido excede el archivo.")
+                End If
+                If nameLen > 0 Then _fs.Position += nameLen
+                sizeWork -= CUInt(nameLen + 1)
+            End If
+
+            Dim isComp As Boolean = r.Compressed
+            Dim uncompLen As UInteger = 0UI
+            If isComp Then
+                If sizeWork < 4UI Then Throw New InvalidDataException("BSA: size < 4 en archivo comprimido.")
+                uncompLen = _br.ReadUInt32()
+                If uncompLen = 0UI Then Throw New InvalidDataException("BSA: tamaño descomprimido = 0.")
+                sizeWork -= 4UI
+            End If
+
+            Dim payloadLen As Integer = CInt(sizeWork)
+            If payloadLen < 0 Then Throw New InvalidDataException("BSA: payloadLen negativo.")
+            Dim payload As Byte() = If(payloadLen > 0, _br.ReadBytes(payloadLen), Array.Empty(Of Byte)())
+            If payload.Length <> payloadLen Then
+                Throw New EndOfStreamException($"BSA: lectura corta del payload (read={payload.Length}, need={payloadLen}).")
+            End If
+
+            ' For BSA, "compressed payload" means the LZ4 frame bytes (without the leading u32
+            ' decompSize, which the writer re-adds). For uncompressed entries, Bytes == raw data,
+            ' DecompSize == payload length, CompSize == 0 (mirroring BA2 conventions).
+            Return New RawCompressedEntry With {
+                .Bytes = payload,
+                .IsCompressed = isComp,
+                .CompSize = If(isComp, CUInt(payload.Length), 0UI),
+                .DecompSize = If(isComp, uncompLen, CUInt(payload.Length)),
+                .HasDx10Metadata = False
+            }
+        End Function
+
+        Public Function GetPayloadSourceByIndex(index As Integer) As PayloadStreamSource Implements IArchiveImpl.GetPayloadSourceByIndex
+            Dim r = _records(index)
+            ' Layout per entry on disk (in order):
+            '   [BSTRING: 1 byte len + (dir + '\\' + filename) bytes]   (only if HasEmbeddedName)
+            '   [u32 LE decompSize]                                     (only if r.Compressed)
+            '   [LZ4 frame OR raw bytes]
+            ' We hand the writer a source pointing at the third part, so it can re-emit the
+            ' BSTRING and decompSize itself (with the entry's current Directory/FileName).
+
+            Dim offPhys As Long = CLng(r.Offset And &H7FFFFFFFUI)
+            Dim sizeWork As Long = CLng(r.SizeField And &H3FFFFFFFUI)
+            Dim cursor As Long = offPhys
+
+            ' Compute BSTRING size from the parsed strings (no disk read needed).
+            If r.HasEmbeddedName Then
+                Dim dirTxt = If(r.Directory, "").Trim(Correct_Path_separator, InCorrect_Path_separator)
+                Dim dirLen As Integer = If(String.IsNullOrEmpty(dirTxt), 0, _enc.GetByteCount(dirTxt))
+                Dim fileLen As Integer = If(r.FileName Is Nothing, 0, _enc.GetByteCount(r.FileName))
+                Dim bstrContent As Integer = dirLen + 1 + fileLen   ' dir + '\\' + filename
+                Dim bstringSize As Integer = 1 + bstrContent        ' length byte + content
+                cursor += bstringSize
+                sizeWork -= bstringSize
+            End If
+
+            Dim decompSize As UInteger = 0
+            If r.Compressed Then
+                If sizeWork < 4 Then Throw New InvalidDataException("BSA: bloque comprimido < 4 bytes (sin u32 decompSize).")
+                ' Single 4-byte read at the position right after the BSTRING. Cheap.
+                _fs.Position = cursor
+                decompSize = _br.ReadUInt32()
+                cursor += 4
+                sizeWork -= 4
+            End If
+
+            If sizeWork < 0 Then Throw New InvalidDataException("BSA: tamaño de payload negativo tras descontar overhead.")
+
+            Return New PayloadStreamSource With {
+                .SourceStream = _fs,
+                .Offset = cursor,
+                .Length = sizeWork,
+                .DecompSize = If(r.Compressed, CLng(decompSize), sizeWork),
+                .IsCompressed = r.Compressed
+            }
+        End Function
 
         Public Sub Dispose() Implements IArchiveImpl.Dispose
             _br?.Dispose()
@@ -497,6 +643,7 @@ Namespace BethesdaArchive.Core
             Public Property Directory As String = ""
             Public Property FileName As String = ""
             Public MustOverride Function Extract(fs As Stream, hdr As Ba2Header) As Byte()
+            Public MustOverride Function ExtractRaw(fs As Stream, hdr As Ba2Header) As RawCompressedEntry
         End Class
 
         ' ---------- GNRL ----------
@@ -574,6 +721,37 @@ Namespace BethesdaArchive.Core
 
                     Return ms.ToArray()
                 End Using
+            End Function
+
+            Public Overrides Function ExtractRaw(fs As Stream, hdr As Ba2Header) As RawCompressedEntry
+                If Chunks Is Nothing OrElse Chunks.Count <> 1 Then
+                    Throw New NotSupportedException(
+                        $"BA2.GNRL: ExtractCompressedPayload requires single-chunk entries (got {If(Chunks Is Nothing, 0, Chunks.Count)}).")
+                End If
+
+                Dim ch = Chunks(0)
+                If CLng(ch.Offset) < 0 OrElse CLng(ch.Offset) >= fs.Length Then
+                    Throw New InvalidDataException($"BA2.GNRL: offset fuera de rango (offset={ch.Offset}).")
+                End If
+                fs.Position = CLng(ch.Offset)
+
+                Dim isComp As Boolean = (ch.CompressedSize <> 0UI)
+                Dim needUL As ULong = If(isComp, CULng(ch.CompressedSize), CULng(ch.DecompressedSize))
+                If needUL > CULng(Integer.MaxValue) Then
+                    Throw New InvalidDataException($"BA2.GNRL: tamaño de chunk excede Int32 (need={needUL}).")
+                End If
+
+                Dim need As Integer = CInt(needUL)
+                Dim packed As Byte() = If(need > 0, New Byte(need - 1) {}, Array.Empty(Of Byte)())
+                If need > 0 Then ReadExact(fs, packed, 0, need)
+
+                Return New RawCompressedEntry With {
+                    .Bytes = packed,
+                    .IsCompressed = isComp,
+                    .CompSize = ch.CompressedSize,
+                    .DecompSize = ch.DecompressedSize,
+                    .HasDx10Metadata = False
+                }
             End Function
 
         End Class
@@ -663,6 +841,47 @@ Namespace BethesdaArchive.Core
 
                     Return ms.ToArray()
                 End Using
+            End Function
+
+            Public Overrides Function ExtractRaw(fs As Stream, hdr As Ba2Header) As RawCompressedEntry
+                If Chunks Is Nothing OrElse Chunks.Count <> 1 Then
+                    Throw New NotSupportedException(
+                        $"BA2.DX10: ExtractCompressedPayload requires single-chunk entries (got {If(Chunks Is Nothing, 0, Chunks.Count)}).")
+                End If
+                If TileMode <> 8 Then
+                    Throw New NotSupportedException($"BA2.DX10: ExtractCompressedPayload requires TileMode=8 (got {TileMode}).")
+                End If
+
+                Dim ch = Chunks(0)
+                If CLng(ch.Offset) < 0 OrElse CLng(ch.Offset) >= fs.Length Then
+                    Throw New InvalidDataException($"BA2.DX10: offset fuera de rango (offset={ch.Offset}).")
+                End If
+                fs.Position = CLng(ch.Offset)
+
+                Dim isComp As Boolean = (ch.CompressedSize <> 0UI)
+                Dim needUL As ULong = If(isComp, CULng(ch.CompressedSize), CULng(ch.DecompressedSize))
+                If needUL > CULng(Integer.MaxValue) Then
+                    Throw New InvalidDataException($"BA2.DX10: tamaño de chunk excede Int32 (need={needUL}).")
+                End If
+
+                Dim need As Integer = CInt(needUL)
+                Dim packed As Byte() = If(need > 0, New Byte(need - 1) {}, Array.Empty(Of Byte)())
+                If need > 0 Then ReadExact(fs, packed, 0, need)
+
+                Dim isCube As Boolean = ((Flags And 1) <> 0)
+                Return New RawCompressedEntry With {
+                    .Bytes = packed,
+                    .IsCompressed = isComp,
+                    .CompSize = ch.CompressedSize,
+                    .DecompSize = ch.DecompressedSize,
+                    .HasDx10Metadata = True,
+                    .Width = CInt(Width),
+                    .Height = CInt(Height),
+                    .MipCount = CInt(If(MipCount = 0, 1, MipCount)),
+                    .DxgiFormat = CInt(DxgiFormatU8),
+                    .IsCubemap = isCube,
+                    .Faces = If(isCube, 6, 1)
+                }
             End Function
 
         End Class
@@ -814,13 +1033,91 @@ Namespace BethesdaArchive.Core
         Public Function ListEntries() As List(Of ArchiveEntry) Implements IArchiveImpl.ListEntries
             Dim list As New List(Of ArchiveEntry)(_entries.Count)
             For Each e In _entries
-                list.Add(New ArchiveEntry With {.Index = e.Index, .Directory = e.Directory, .FileName = e.FileName})
+                ' Sum chunk decompressed sizes — already parsed from the archive's per-file
+                ' chunk headers during Open(). Zero extra I/O.
+                Dim decomp As Long = 0
+                Dim eg = TryCast(e, EntryGNRL)
+                If eg IsNot Nothing Then
+                    For Each ch In eg.Chunks
+                        decomp += CLng(ch.DecompressedSize)
+                    Next
+                Else
+                    Dim ed = TryCast(e, EntryDX10)
+                    If ed IsNot Nothing Then
+                        For Each ch In ed.Chunks
+                            decomp += CLng(ch.DecompressedSize)
+                        Next
+                    End If
+                End If
+                list.Add(New ArchiveEntry With {
+                    .Index = e.Index,
+                    .Directory = e.Directory,
+                    .FileName = e.FileName,
+                    .DecompressedSize = decomp
+                })
             Next
             Return list
         End Function
 
         Public Function ExtractByIndex(index As Integer) As Byte() Implements IArchiveImpl.ExtractByIndex
             Return _entries(index).Extract(_fs, _hdr)
+        End Function
+
+        Public Function ExtractRawByIndex(index As Integer) As RawCompressedEntry Implements IArchiveImpl.ExtractRawByIndex
+            Return _entries(index).ExtractRaw(_fs, _hdr)
+        End Function
+
+        Public Function GetPayloadSourceByIndex(index As Integer) As PayloadStreamSource Implements IArchiveImpl.GetPayloadSourceByIndex
+            ' BA2 chunk headers are fully parsed at Open(). The payload is a self-contained
+            ' zlib stream / LZ4 raw block / uncompressed blob — no BSTRING or decompSize
+            ' prefix to skip, so we hand a direct reference to the chunk bytes.
+            Dim e = _entries(index)
+            Dim eg = TryCast(e, EntryGNRL)
+            If eg IsNot Nothing Then
+                If eg.Chunks Is Nothing OrElse eg.Chunks.Count <> 1 Then
+                    Throw New NotSupportedException(
+                        $"BA2.GNRL: GetPayloadSource requires single-chunk entries (got {If(eg.Chunks Is Nothing, 0, eg.Chunks.Count)}).")
+                End If
+                Dim ch = eg.Chunks(0)
+                Dim isComp As Boolean = (ch.CompressedSize <> 0UI)
+                Return New PayloadStreamSource With {
+                    .SourceStream = _fs,
+                    .Offset = CLng(ch.Offset),
+                    .Length = If(isComp, CLng(ch.CompressedSize), CLng(ch.DecompressedSize)),
+                    .DecompSize = CLng(ch.DecompressedSize),
+                    .IsCompressed = isComp
+                }
+            End If
+
+            Dim ed = TryCast(e, EntryDX10)
+            If ed IsNot Nothing Then
+                If ed.Chunks Is Nothing OrElse ed.Chunks.Count <> 1 Then
+                    Throw New NotSupportedException(
+                        $"BA2.DX10: GetPayloadSource requires single-chunk entries (got {If(ed.Chunks Is Nothing, 0, ed.Chunks.Count)}).")
+                End If
+                If ed.TileMode <> 8 Then
+                    Throw New NotSupportedException($"BA2.DX10: GetPayloadSource requires TileMode=8 (got {ed.TileMode}).")
+                End If
+                Dim ch = ed.Chunks(0)
+                Dim isComp As Boolean = (ch.CompressedSize <> 0UI)
+                Dim isCube As Boolean = ((ed.Flags And 1) <> 0)
+                Return New PayloadStreamSource With {
+                    .SourceStream = _fs,
+                    .Offset = CLng(ch.Offset),
+                    .Length = If(isComp, CLng(ch.CompressedSize), CLng(ch.DecompressedSize)),
+                    .DecompSize = CLng(ch.DecompressedSize),
+                    .IsCompressed = isComp,
+                    .HasDx10Metadata = True,
+                    .Width = CInt(ed.Width),
+                    .Height = CInt(ed.Height),
+                    .MipCount = CInt(If(ed.MipCount = 0, CByte(1), ed.MipCount)),
+                    .DxgiFormat = CInt(ed.DxgiFormatU8),
+                    .IsCubemap = isCube,
+                    .Faces = If(isCube, 6, 1)
+                }
+            End If
+
+            Throw New NotSupportedException("BA2: tipo de entry no soportado por GetPayloadSource.")
         End Function
 
         Public Sub Dispose() Implements IArchiveImpl.Dispose

@@ -12,7 +12,9 @@ Namespace BethesdaArchive.Core
                 Return Directory.TrimEnd(Correct_Path_separator, InCorrect_Path_separator) & Correct_Path_separator & FileName
             End Get
         End Property
-        Public Property Data As Byte()             ' Contenido lógico
+        ' Contenido lógico completo del archivo. Ej.: para texturas DX10 contiene el DDS
+        ' completo con cabecera; el writer DX10 deriva internamente el payload del archive.
+        Public Property Data As Byte()
         Public Property PreferCompress As Boolean  ' Para BSA/BA2.GNRL
 
         ' DX10 metadata
@@ -20,6 +22,83 @@ Namespace BethesdaArchive.Core
         Public Property Width As Integer
         Public Property Height As Integer
         Public Property MipCount As Integer
+        Public Property IsCubemap As Boolean
+        Public Property Faces As Integer
+
+        ' CRC32 of the logical (decompressed) Data. Used by callers (e.g. Wardrobe Pack) for cheap
+        ' diff against an existing archive; writers do NOT consume this field.
+        Public Property Crc32 As UInteger
+
+        ' Pass-through of pre-compressed bytes (in-memory variant). When PreCompressed=True the
+        ' writer skips its own compression step and writes PreCompressedBytes verbatim, using
+        ' PreCompressedCompSize as the chunk's "compressed size" field (0 means stored uncompressed).
+        ' Compatibility constraint: same Version + CompressionFormat between source and destination.
+        ' Mixing v3/LZ4 with v8/Zlib produces corrupted output.
+        Public Property PreCompressed As Boolean
+        Public Property PreCompressedBytes As Byte()
+        Public Property PreCompressedCompSize As UInteger   ' 0 = stored raw, >0 = compressed length
+        Public Property PreCompressedDecompSize As UInteger ' decompressed length (== Data.Length when known)
+
+        ' Pass-through of pre-compressed bytes (streaming variant). Preferred over the in-memory
+        ' PreCompressed* fields for multi-GB rewrites: the writer seeks PayloadSource.SourceStream
+        ' to PayloadSource.Offset and copies PayloadSource.Length bytes directly into the output
+        ' with a small reusable buffer. RAM peak per entry stays at the buffer size (~64 KB)
+        ' regardless of payload size.
+        '
+        ' Same Version/CompressionFormat compatibility constraint as PreCompressed*. The caller
+        ' must keep SourceStream alive for the entire writer call. When set, the writer ignores
+        ' Data, PreCompressed*, and uses PayloadSource.IsCompressed as the authoritative
+        ' compression state for this entry.
+        Public Property PayloadSource As PayloadStreamSource
+    End Class
+
+    ''' <summary>
+    ''' Streamed pass-through reference — the writer copies Length bytes from SourceStream at
+    ''' Offset directly into the archive output, without buffering the payload in a managed array.
+    ''' For BA2 GNRL/DX10: bytes refer to the chunk payload as-is (zlib stream / LZ4 raw block /
+    ''' uncompressed). The writer pairs them with a freshly emitted chunk header.
+    ''' For BSA: bytes refer to the LZ4 frame (compressed) or raw payload (non-compressed) ONLY,
+    ''' WITHOUT the embedded BSTRING name prefix and WITHOUT the u32 decompSize prefix — the
+    ''' writer emits those itself based on the entry's current Directory/FileName and DecompSize.
+    ''' </summary>
+    Public NotInheritable Class PayloadStreamSource
+        Public Property SourceStream As IO.Stream
+        Public Property Offset As Long
+        Public Property Length As Long
+        Public Property DecompSize As Long
+        Public Property IsCompressed As Boolean
+
+        ' DX10 metadata, populated only when the source archive entry is BA2 DX10. Lets the
+        ' writer rebuild the chunk header without reparsing the payload.
+        Public Property HasDx10Metadata As Boolean
+        Public Property Width As Integer
+        Public Property Height As Integer
+        Public Property MipCount As Integer
+        Public Property DxgiFormat As Integer
+        Public Property IsCubemap As Boolean
+        Public Property Faces As Integer
+    End Class
+
+    ''' <summary>
+    ''' Raw payload extracted from an archive entry without decompression. Returned by
+    ''' BethesdaReader.ExtractCompressedPayload for stream-copy scenarios.
+    ''' For BA2 GNRL/DX10: Bytes is the chunk's raw payload exactly as stored on disk
+    ''' (compressed if CompSize>0, raw if CompSize=0). Multi-chunk entries are not supported here
+    ''' (writers we control emit single-chunk entries by convention).
+    ''' For BSA: Bytes is the post-BSTRING / post-decompSize payload (i.e. the LZ4 frame when
+    ''' compressed, or the raw bytes when not), without the embedded name prefix.
+    ''' </summary>
+    Public NotInheritable Class RawCompressedEntry
+        Public Property Bytes As Byte()
+        Public Property IsCompressed As Boolean
+        Public Property CompSize As UInteger    ' 0 if stored raw; otherwise == Bytes.Length
+        Public Property DecompSize As UInteger
+        ' DX10 metadata, populated only when source is a BA2 DX10 entry.
+        Public Property HasDx10Metadata As Boolean
+        Public Property Width As Integer
+        Public Property Height As Integer
+        Public Property MipCount As Integer
+        Public Property DxgiFormat As Integer
         Public Property IsCubemap As Boolean
         Public Property Faces As Integer
     End Class

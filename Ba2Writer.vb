@@ -42,14 +42,42 @@ Namespace BethesdaArchive.Core
         End Sub
 
         Friend Shared Function Crc32Ascii(text As String) As UInteger
-            Dim bytes = Encoding.ASCII.GetBytes(text)
+            Return Crc32Bytes(Encoding.ASCII.GetBytes(text))
+        End Function
+
+        ''' <summary>Standard zip CRC32 (poly 0xEDB88320) over arbitrary bytes. Public for external
+        ''' use (e.g. ArchivePackager diff: hash a VirtualEntry.Data once, compare against CRC32 of
+        ''' an existing entry's decompressed payload).</summary>
+        Public Shared Function Crc32Bytes(bytes As Byte()) As UInteger
             Dim crc As UInteger = &HFFFFFFFFUI
+            If bytes Is Nothing Then Return Not crc
             For Each bt In bytes
                 Dim idx = (crc Xor bt) And &HFFUI
                 crc = (crc >> 8) Xor Crc32Table(CInt(idx))
             Next
             Return Not crc
         End Function
+
+        ''' <summary>
+        ''' Seeks <paramref name="source"/> to <paramref name="offset"/> and copies exactly
+        ''' <paramref name="count"/> bytes into <paramref name="dest"/> using a 64 KB reusable
+        ''' buffer. Throws EndOfStreamException on short reads. Used by writers when a
+        ''' VirtualEntry.PayloadSource is set, so the chunk is moved between archives without
+        ''' allocating a managed buffer for the whole payload.
+        ''' </summary>
+        Friend Shared Sub StreamCopyExact(source As IO.Stream, offset As Long, count As Long, dest As IO.Stream)
+            If count <= 0 Then Return
+            source.Position = offset
+            Dim buf(65535) As Byte
+            Dim remaining As Long = count
+            While remaining > 0
+                Dim toRead As Integer = CInt(Math.Min(CLng(buf.Length), remaining))
+                Dim n = source.Read(buf, 0, toRead)
+                If n <= 0 Then Throw New IO.EndOfStreamException($"StreamCopyExact: short read at offset {source.Position} (need {remaining} more).")
+                dest.Write(buf, 0, n)
+                remaining -= n
+            End While
+        End Sub
 
         Friend Shared Function PackExt(ext As String) As UInteger
             ext = ext.ToLowerInvariant()
@@ -222,7 +250,9 @@ Namespace BethesdaArchive.Core
 
         ''' <summary>
         ''' Escribe un BA2 DX10 (FO4 v1/v7/v8) en el stream de salida.
-        ''' Cada VirtualEntry debe tener: Data, DxgiFormat (0..255), Width, Height, MipCount, Faces, IsCubemap.
+        ''' Cada VirtualEntry debe tener Data lógico de archivo. Para DDS, Data puede ser el DDS
+        ''' completo (recomendado) o, por compatibilidad, el payload legacy sin cabecera. El writer
+        ''' deriva internamente el blob DX10 a partir del DDS cuando detecta el magic "DDS ".
         ''' Compresión: ZLIB (RFC1950). Si comp >= raw => store (CompressedSize = 0).
         ''' </summary>
         Public Shared Sub Write(output As Stream, entries As IEnumerable(Of VirtualEntry), opts As Options)
@@ -251,11 +281,29 @@ Namespace BethesdaArchive.Core
             Dim perFile = New List(Of FileMeta)(list.Count)
             Dim iFile As Integer = 0
             For Each ve In list
-                ' Validar metadata obligatoria
+                Dim raw As Byte()
+
+                If ve.PreCompressed Then
+                    raw = Array.Empty(Of Byte)()      ' no se usa cuando hay pass-through
+                Else
+                    raw = If(ve.Data, Array.Empty(Of Byte)())
+                    ' Contract: VirtualEntry.Data for BA2 DX10 must be the stripped DDS payload
+                    ' (mip data only, no header). Use Dx10Importer.FromDdsBytes() or
+                    ' Dx10Importer.SplitDdsBytes() to produce a correct VirtualEntry.
+                    If Dx10Importer.HasDdsMagic(raw) Then
+                        Throw New InvalidDataException(
+                            "BA2 DX10: VirtualEntry.Data must be the stripped DDS payload, not the full DDS file. " &
+                            "Use Dx10Importer.FromDdsBytes() or Dx10Importer.SplitDdsBytes() before passing.")
+                    End If
+                End If
+
+                ' Validate DX10 metadata (always required, regardless of PreCompressed). The caller
+                ' is responsible for populating these fields from the source DDS header.
                 If ve.Width <= 0 OrElse ve.Height <= 0 Then Throw New InvalidDataException("DX10: Width/Height inválidos.")
                 If ve.MipCount <= 0 Then Throw New InvalidDataException("DX10: MipCount inválido.")
                 If ve.Faces <= 0 Then Throw New InvalidDataException("DX10: Faces inválido.")
                 If ve.DxgiFormat < 0 OrElse ve.DxgiFormat > 255 Then Throw New InvalidDataException("DX10: DxgiFormat inválido (0..255).")
+                Dim faces As Integer = If(ve.IsCubemap, 6, ve.Faces)
 
                 ' Hashes
                 Dim relNorm As String = PathUtil.JoinDirFile(ve.Directory, ve.FileName)
@@ -280,26 +328,41 @@ Namespace BethesdaArchive.Core
                 fm.Dx10_Flags = If(ve.IsCubemap, CByte(1), CByte(0))
                 fm.Dx10_TileMode = CByte(8) ' como en el C++
 
-                ' Datos
-                Dim raw As Byte() = If(ve.Data, Array.Empty(Of Byte)())
-                If raw.Length > Integer.MaxValue Then Throw New InvalidDataException("DX10: archivo demasiado grande.")
-                fm.Chunk_DecompSize = CUInt(raw.Length)
                 fm.Chunk_MipFirst = 0US
                 fm.Chunk_MipLast = CUShort(ve.MipCount - 1)
 
-                ' ZLIB bien formado (CMF/FLG + Adler-32). Si no mejora => store.
-                ' Compresión según Version/CompressionFormat:
-                ' - v3 + LZ4 => LZ4 raw
-                ' - resto => ZLIB
-                Dim comp As Byte()
-                If opts.Version = 3UI AndAlso opts.CompressionFormat = Ba2WriterCommon.CompressionFormat.Lz4 Then
-                    comp = Ba2WriterCommon.CompressLz4(raw)
+                If ve.PayloadSource IsNot Nothing Then
+                    ' Stream-copy from another archive — same Version + CompressionFormat assumed.
+                    Dim ps = ve.PayloadSource
+                    fm.Chunk_DecompSize = CUInt(ps.DecompSize)
+                    fm.Chunk_CompSize = If(ps.IsCompressed, CUInt(ps.Length), 0UI)
+                    fm.Chunk_CompData = Nothing
+                    fm.Chunk_PayloadSrc = ps
+                ElseIf ve.PreCompressed Then
+                    ' Pass-through: caller supplies chunk bytes already formatted for this archive's
+                    ' Version/CompressionFormat. Sizes come from the source chunk header verbatim.
+                    fm.Chunk_DecompSize = ve.PreCompressedDecompSize
+                    fm.Chunk_CompSize = ve.PreCompressedCompSize
+                    fm.Chunk_CompData = If(ve.PreCompressedBytes, Array.Empty(Of Byte)())
                 Else
-                    comp = Ba2WriterCommon.CompressZlib(raw, opts.ZlibPreset)
+                    ' raw is the stripped DDS payload (mips concatenated). Compress directly.
+                    If raw.Length > Integer.MaxValue Then Throw New InvalidDataException("DX10: archivo demasiado grande.")
+                    fm.Chunk_DecompSize = CUInt(raw.Length)
+
+                    ' ZLIB bien formado (CMF/FLG + Adler-32). Si no mejora => store.
+                    ' Compresión según Version/CompressionFormat:
+                    ' - v3 + LZ4 => LZ4 raw
+                    ' - resto => ZLIB
+                    Dim comp As Byte()
+                    If opts.Version = 3UI AndAlso opts.CompressionFormat = Ba2WriterCommon.CompressionFormat.Lz4 Then
+                        comp = Ba2WriterCommon.CompressLz4(raw)
+                    Else
+                        comp = Ba2WriterCommon.CompressZlib(raw, opts.ZlibPreset)
+                    End If
+                    Dim useComp As Boolean = comp IsNot Nothing AndAlso comp.Length > 0 AndAlso comp.Length < raw.Length
+                    fm.Chunk_CompSize = CUInt(If(useComp, comp.Length, 0))
+                    fm.Chunk_CompData = If(useComp, comp, raw)
                 End If
-                Dim useComp As Boolean = comp IsNot Nothing AndAlso comp.Length > 0 AndAlso comp.Length < raw.Length
-                fm.Chunk_CompSize = CUInt(If(useComp, comp.Length, 0))
-                fm.Chunk_CompData = If(useComp, comp, raw)
 
                 fm.FileName = ve.FileName
                 fm.Directory = ve.Directory
@@ -367,10 +430,14 @@ Namespace BethesdaArchive.Core
                 Ba2WriterCommon.WriteU64(output, off)
                 output.Position = save
 
-                ' Escribir payload (comp o raw según política)
-                Dim cd = fm.Chunk_CompData
-                If cd IsNot Nothing AndAlso cd.Length > 0 Then
-                    output.Write(cd, 0, cd.Length)
+                ' Escribir payload: PayloadSrc (stream-copy) > Chunk_CompData (in-memory).
+                If fm.Chunk_PayloadSrc IsNot Nothing Then
+                    Ba2WriterCommon.StreamCopyExact(fm.Chunk_PayloadSrc.SourceStream, fm.Chunk_PayloadSrc.Offset, fm.Chunk_PayloadSrc.Length, output)
+                Else
+                    Dim cd = fm.Chunk_CompData
+                    If cd IsNot Nothing AndAlso cd.Length > 0 Then
+                        output.Write(cd, 0, cd.Length)
+                    End If
                 End If
             Next
 
@@ -413,7 +480,8 @@ Namespace BethesdaArchive.Core
             Public Chunk_DecompSize As UInteger
             Public Chunk_MipFirst As UShort
             Public Chunk_MipLast As UShort
-            Public Chunk_CompData As Byte()
+            Public Chunk_CompData As Byte()                    ' bytes to emit when Chunk_PayloadSrc is null
+            Public Chunk_PayloadSrc As PayloadStreamSource    ' stream-copy source (mutually exclusive with Chunk_CompData)
             Public FileName As String
             Public Directory As String
         End Class
@@ -468,35 +536,76 @@ Namespace BethesdaArchive.Core
                 Dim parent As String = "", stem As String = "", extNoDot As String = ""
                 Ba2WriterCommon.Fo4SplitPath(norm, parent, stem, extNoDot)
 
-                Dim raw As Byte() = If(ve.Data, Array.Empty(Of Byte)())
-                If raw.Length > Integer.MaxValue Then Throw New InvalidDataException("Archivo demasiado grande (GNRL).")
-
-                ' Compresión según Version/CompressionFormat:
-                ' - v3 + LZ4 => LZ4 raw
-                ' - resto => ZLIB
-                Dim comp As Byte()
-                If opts.Version = 3UI AndAlso opts.CompressionFormat = Ba2WriterCommon.CompressionFormat.Lz4 Then
-                    comp = Ba2WriterCommon.CompressLz4(raw)
+                ' Three pass-through / compress paths:
+                '   1) PayloadSource: stream-copy from another archive, no managed payload buffer.
+                '   2) PreCompressed (in-memory): caller supplies the chunk bytes already encoded.
+                '   3) Default: compress ve.Data with the writer's configured codec.
+                ' Paths 1 and 2 require the source archive to have used the same Version + format.
+                Dim fm As FileMeta
+                If ve.PayloadSource IsNot Nothing Then
+                    Dim ps = ve.PayloadSource
+                    fm = New FileMeta With {
+                        .Index = i,
+                        .HashFile = Ba2WriterCommon.Crc32Ascii(stem),
+                        .HashExt = Ba2WriterCommon.PackExt(extNoDot),
+                        .HashDir = Ba2WriterCommon.Crc32Ascii(parent),
+                        .ModIndex = 0,
+                        .ChunkCount = 1,
+                        .ChunkHeaderSize = CUShort(16),
+                        .CompSize = If(ps.IsCompressed, CUInt(ps.Length), 0UI),
+                        .DecompSize = CUInt(ps.DecompSize),
+                        .Directory = ve.Directory,
+                        .FileName = ve.FileName,
+                        .CompData = Nothing,
+                        .PayloadSrc = ps
+                    }
+                ElseIf ve.PreCompressed Then
+                    Dim pc As Byte() = If(ve.PreCompressedBytes, Array.Empty(Of Byte)())
+                    fm = New FileMeta With {
+                        .Index = i,
+                        .HashFile = Ba2WriterCommon.Crc32Ascii(stem),
+                        .HashExt = Ba2WriterCommon.PackExt(extNoDot),
+                        .HashDir = Ba2WriterCommon.Crc32Ascii(parent),
+                        .ModIndex = 0,
+                        .ChunkCount = 1,
+                        .ChunkHeaderSize = CUShort(16),
+                        .CompSize = ve.PreCompressedCompSize,
+                        .DecompSize = ve.PreCompressedDecompSize,
+                        .Directory = ve.Directory,
+                        .FileName = ve.FileName,
+                        .CompData = pc
+                    }
                 Else
-                    comp = Ba2WriterCommon.CompressZlib(raw, opts.ZlibPreset)
+                    Dim raw As Byte() = If(ve.Data, Array.Empty(Of Byte)())
+                    If raw.Length > Integer.MaxValue Then Throw New InvalidDataException("Archivo demasiado grande (GNRL).")
+
+                    ' Compresión según Version/CompressionFormat:
+                    ' - v3 + LZ4 => LZ4 raw
+                    ' - resto => ZLIB
+                    Dim comp As Byte()
+                    If opts.Version = 3UI AndAlso opts.CompressionFormat = Ba2WriterCommon.CompressionFormat.Lz4 Then
+                        comp = Ba2WriterCommon.CompressLz4(raw)
+                    Else
+                        comp = Ba2WriterCommon.CompressZlib(raw, opts.ZlibPreset)
+                    End If
+
+                    Dim useComp As Boolean = comp IsNot Nothing AndAlso comp.Length > 0 AndAlso comp.Length < raw.Length
+
+                    fm = New FileMeta With {
+                        .Index = i,
+                        .HashFile = Ba2WriterCommon.Crc32Ascii(stem),
+                        .HashExt = Ba2WriterCommon.PackExt(extNoDot),
+                        .HashDir = Ba2WriterCommon.Crc32Ascii(parent),
+                        .ModIndex = 0,
+                        .ChunkCount = 1,
+                        .ChunkHeaderSize = CUShort(16),              ' GNRL: 16 bytes; el sentinel se escribe aparte
+                        .CompSize = CUInt(If(useComp, comp.Length, 0)),
+                        .DecompSize = CUInt(raw.Length),
+                        .Directory = ve.Directory,
+                        .FileName = ve.FileName,
+                        .CompData = If(useComp, comp, raw)           ' lo que realmente se escribirá en payload
+                    }
                 End If
-
-                Dim useComp As Boolean = comp IsNot Nothing AndAlso comp.Length > 0 AndAlso comp.Length < raw.Length
-
-                Dim fm As New FileMeta With {
-            .Index = i,
-            .HashFile = Ba2WriterCommon.Crc32Ascii(stem),
-            .HashExt = Ba2WriterCommon.PackExt(extNoDot),
-            .HashDir = Ba2WriterCommon.Crc32Ascii(parent),
-            .ModIndex = 0,
-            .ChunkCount = 1,
-            .ChunkHeaderSize = CUShort(16),              ' GNRL: 16 bytes; el sentinel se escribe aparte
-            .CompSize = CUInt(If(useComp, comp.Length, 0)),
-            .DecompSize = CUInt(raw.Length),
-            .Directory = ve.Directory,
-            .FileName = ve.FileName,
-            .CompData = If(useComp, comp, raw)           ' lo que realmente se escribirá en payload
-        }
                 metas.Add(fm)
                 RaiseEvent Writed()
             Next
@@ -556,8 +665,10 @@ Namespace BethesdaArchive.Core
                 Ba2WriterCommon.WriteU64(output, absOff)
                 output.Position = save
 
-                ' Escribir los datos reales (comp o raw según política)
-                If fm.CompData IsNot Nothing AndAlso fm.CompData.Length > 0 Then
+                ' Escribir los datos reales: PayloadSrc (stream-copy) > CompData (in-memory bytes).
+                If fm.PayloadSrc IsNot Nothing Then
+                    Ba2WriterCommon.StreamCopyExact(fm.PayloadSrc.SourceStream, fm.PayloadSrc.Offset, fm.PayloadSrc.Length, output)
+                ElseIf fm.CompData IsNot Nothing AndAlso fm.CompData.Length > 0 Then
                     output.Write(fm.CompData, 0, fm.CompData.Length)
                 End If
             Next
@@ -591,11 +702,13 @@ Namespace BethesdaArchive.Core
             Public ModIndex As Byte
             Public ChunkCount As Byte
             Public ChunkHeaderSize As UShort
+            Public ChunkOffset As ULong         ' set during single-pass write; back-patched into the reserved file header block
             Public CompSize As UInteger
             Public DecompSize As UInteger
             Public Directory As String
             Public FileName As String
-            Public CompData As Byte()
+            Public CompData As Byte()           ' bytes to emit when PayloadSrc is null
+            Public PayloadSrc As PayloadStreamSource ' stream-copy source (mutually exclusive with CompData)
         End Class
 
 

@@ -188,87 +188,100 @@ Namespace BethesdaArchive.Core
             Dim header_FolderNameLength As UInteger = If(hasDirStrings, CUInt(folderNamesRawSum + folderCount), 0UI)
             Dim header_FileNameLength As UInteger = If(hasFileStrings, CUInt(fileNamesRawSum + fileCount), 0UI)
 
-            ' ---- Construcción de PAYLOADS (con BSTRING si corresponde) + SizeField ----
-            ' Guardamos por key lógico → (SizeField, OffsetAbs=0 temporal, Payload)
-            Dim recByKey As New Dictionary(Of String, (SizeField As UInteger, OffsetAbs As UInteger, Payload As Byte()))(StringComparer.OrdinalIgnoreCase)
+            ' ---- Build per-entry write records (sizeField + BSTRING bytes + payload source) ----
+            ' Three payload paths:
+            '   1) PayloadSource: stream-copy from a source archive at write time.
+            '   2) PreCompressed: caller-supplied LZ4 frame (or raw bytes) in PreCompressedBytes.
+            '   3) Default: compress ve.Data with LZ4 frame (when wantCompressed) or store raw.
+            ' Compression is decided per-entry via wantCompressed; bit30 of sizeField marks any
+            ' override against the archive's global Compressed flag.
+            Dim recByKey As New Dictionary(Of String, BsaWriteRecord)(StringComparer.OrdinalIgnoreCase)
 
             For Each e In entries
-                Using ms As New MemoryStream()
-                    Dim raw As Byte() = e.Data
+                Dim rec As New BsaWriteRecord()
 
-                    ' === Decide compresión efectiva (override vs global) ===
-                    ' - Si PreferCompress=True y global=False → compress
-                    ' - Si PreferCompress=False y global=True → no compress
-                    ' - Sino, seguir global.
-                    Dim wantCompressed As Boolean = opts.GlobalCompressed
+                ' === Decide compresión efectiva (override vs global) ===
+                Dim wantCompressed As Boolean
+                If e.PayloadSource IsNot Nothing Then
+                    wantCompressed = e.PayloadSource.IsCompressed
+                ElseIf e.PreCompressed Then
+                    wantCompressed = (e.PreCompressedCompSize > 0UI)
+                Else
+                    wantCompressed = opts.GlobalCompressed
                     If e.PreferCompress AndAlso Not opts.GlobalCompressed Then wantCompressed = True
                     If (Not e.PreferCompress) AndAlso opts.GlobalCompressed Then wantCompressed = False
+                End If
+                rec.WantCompressed = wantCompressed
 
-                    ' === [BSTRING embebido] u8 len + (dir + '\' + file) (SIN NUL) ===
-                    Dim namesBytes As Integer = 0
-                    Dim dirBytes() As Byte = Array.Empty(Of Byte)()
-                    Dim fileBytes() As Byte = Array.Empty(Of Byte)()
-                    If opts.EmbedNames Then
-                        Dim dirTxt = If(e.Directory, "").Trim(Correct_Path_separator)
-                        dirBytes = enc.GetBytes(dirTxt)
-                        fileBytes = enc.GetBytes(e.FileName)
+                ' === Precompute BSTRING bytes (length-prefix + dir + '\' + filename, no NUL) ===
+                Dim namesBytes As Integer = 0
+                If opts.EmbedNames Then
+                    Dim dirTxt = If(e.Directory, "").Trim(Correct_Path_separator)
+                    Dim dirBytes = enc.GetBytes(dirTxt)
+                    Dim fileBytes = enc.GetBytes(e.FileName)
+                    Dim bstrlen As Integer = dirBytes.Length + 1 + fileBytes.Length
+                    If bstrlen > 255 Then
+                        Throw New InvalidDataException($"BSTRING > 255: '{dirTxt}\{e.FileName}'")
+                    End If
+                    Dim bstring(1 + bstrlen - 1) As Byte
+                    bstring(0) = CByte(bstrlen)
+                    Buffer.BlockCopy(dirBytes, 0, bstring, 1, dirBytes.Length)
+                    bstring(1 + dirBytes.Length) = &H5C ' '\'
+                    Buffer.BlockCopy(fileBytes, 0, bstring, 1 + dirBytes.Length + 1, fileBytes.Length)
+                    rec.BstringBytes = bstring
+                    namesBytes = 1 + bstrlen
+                End If
 
-                        ' SSE/C++: SIEMPRE incluir el separador '\' aunque la carpeta esté vacía (raíz)
-                        Dim bstrlen As Integer = dirBytes.Length + 1 + fileBytes.Length
-                        If bstrlen > 255 Then
-                            Throw New InvalidDataException($"BSTRING > 255: '{dirTxt}\{e.FileName}'")
-                        End If
-                        ms.WriteByte(CByte(bstrlen))
-                        If dirBytes.Length > 0 Then ms.Write(dirBytes, 0, dirBytes.Length)
-                        ms.WriteByte(&H5C) ' '\'
-                        If fileBytes.Length > 0 Then ms.Write(fileBytes, 0, fileBytes.Length)
-
-                        namesBytes = 1 + bstrlen
-                        End If
-
-
-                        ' === Parte de DATOS (lo que hay "en disco"): si comprimido → u32 decompSize + LZ4 frame; si no → raw ===
-                        Dim posAfterNames As Long = ms.Position
+                ' === Resolve payload source and total dataBytes (including u32 decompSize prefix) ===
+                Dim dataBytes As Long = 0
+                If e.PayloadSource IsNot Nothing Then
+                    Dim ps = e.PayloadSource
+                    rec.PayloadSrc = ps
+                    rec.DecompSize = CUInt(ps.DecompSize)
+                    dataBytes = If(wantCompressed, 4L, 0L) + ps.Length
+                ElseIf e.PreCompressed Then
+                    Dim pc As Byte() = If(e.PreCompressedBytes, Array.Empty(Of Byte)())
+                    rec.PayloadBytes = pc
+                    rec.DecompSize = e.PreCompressedDecompSize
+                    dataBytes = If(wantCompressed, 4L, 0L) + pc.Length
+                Else
+                    Dim raw As Byte() = If(e.Data, Array.Empty(Of Byte)())
                     If wantCompressed Then
-                        ' u32 LE con tamaño descomprimido + LZ4F frame
-                        Dim u = BitConverter.GetBytes(CUInt(raw.Length))
-                        ms.Write(u, 0, 4)
-
-                        ' Ajustes de LZ4 para asemejarse al writer de referencia (HC default, sin content length/checksums).
-                        Using lz As Stream = LZ4Stream.Encode(ms,
-                    New LZ4EncoderSettings() With {
-                        .CompressionLevel = K4os.Compression.LZ4.LZ4Level.L04_HC, ' ~ default HC
-                        .ChainBlocks = True,
-                        .ContentChecksum = False,
-                        .BlockSize = 4 * 1024 * 1024,
-                        .BlockChecksum = False,
-                        .ContentLength = Nothing
-                    },
-                    leaveOpen:=True)
-                            If raw.Length > 0 Then lz.Write(raw, 0, raw.Length)
+                        ' Compress now. The encoded LZ4 frame's exact length is needed for sizeField,
+                        ' so we have to materialize it. Memory peak per entry = comp frame size.
+                        Using ms As New MemoryStream()
+                            Using lz As Stream = LZ4Stream.Encode(ms,
+                                New LZ4EncoderSettings() With {
+                                    .CompressionLevel = K4os.Compression.LZ4.LZ4Level.L04_HC,
+                                    .ChainBlocks = True,
+                                    .ContentChecksum = False,
+                                    .BlockSize = 4 * 1024 * 1024,
+                                    .BlockChecksum = False,
+                                    .ContentLength = Nothing
+                                },
+                                leaveOpen:=True)
+                                If raw.Length > 0 Then lz.Write(raw, 0, raw.Length)
+                            End Using
+                            rec.PayloadBytes = ms.ToArray()
                         End Using
+                        rec.DecompSize = CUInt(raw.Length)
+                        dataBytes = 4L + rec.PayloadBytes.Length
                     Else
-                        If raw.Length > 0 Then ms.Write(raw, 0, raw.Length)
+                        rec.PayloadBytes = raw
+                        rec.DecompSize = CUInt(raw.Length)
+                        dataBytes = raw.Length
                     End If
+                End If
 
-                    Dim payload As Byte() = ms.ToArray()
+                ' === sizeField (low 30 bits = bytes-on-disk of the entry block) ===
+                Dim sizeNoFlags As Long = CLng(namesBytes) + dataBytes
+                If sizeNoFlags > &H3FFFFFFFUI Then Throw New OverflowException($"BSA: sizeField demasiado grande ({sizeNoFlags}).")
+                Dim sizeField As UInteger = CUInt(sizeNoFlags)
+                If (wantCompressed Xor opts.GlobalCompressed) Then sizeField = sizeField Or ICOMPRESSION
+                rec.SizeField = sizeField
+                rec.BlockBytesOnDisk = sizeNoFlags
 
-                    ' === sizeField (lo que "informan" los lectores) = bytes en disco del BLOQUE ===
-                    ' fsize = (Embed? 1+len(dir)+1+len(file) : 0) + (Comprimido? 4 + LZ4FrameLen : rawLen)
-                    Dim dataBytes As Integer = CInt(ms.Length - posAfterNames) ' incluye el +4 del decomp size si comprimido
-                    Dim sizeNoFlags As UInteger = CUInt(namesBytes + dataBytes)
-                    If sizeNoFlags > &H3FFFFFFFUI Then Throw New OverflowException($"BSA: sizeField demasiado grande ({sizeNoFlags}).")
-
-                    Dim sizeField As UInteger = sizeNoFlags
-                    ' bit30 override si la compresión efectiva difiere de la global
-                    If (wantCompressed Xor opts.GlobalCompressed) Then
-                        sizeField = sizeField Or ICOMPRESSION
-                    End If
-
-                    ' Guardar registro (Size, OffsetAbs=0 temporal, Payload a escribir)
-                    recByKey(PathUtil.JoinDirFile(e.Directory, e.FileName)) =
-                (sizeField, 0UI, payload)
-                End Using
+                recByKey(PathUtil.JoinDirFile(e.Directory, e.FileName)) = rec
                 RaiseEvent Writed()
             Next
 
@@ -290,8 +303,8 @@ Namespace BethesdaArchive.Core
                 If runData < 0 OrElse runData > UInteger.MaxValue Then Throw New OverflowException("Offset > 4GB.")
                 rec.OffsetAbs = CUInt(runData)
                 recByKey(key) = rec
-                ' Avanzar exactamente lo que ocupa el BLOQUE en disco (BSTRING + datos [+4 si comp]), sin padding.
-                runData += If(rec.Payload Is Nothing, 0, rec.Payload.Length)
+                ' Avance: BSTRING + (u32 si comp) + payload bytes — el total ya lo precomputamos.
+                runData += rec.BlockBytesOnDisk
             Next
 
             ' Calcular inicio del bloque de carpeta (BZString) y el primer file-entry
@@ -383,17 +396,45 @@ Namespace BethesdaArchive.Core
                 Throw New InvalidDataException($"Desalineado: fin de tabla de nombres={output.Position}, esperado posFileData={expectedPos}.")
             End If
 
-            ' DATA: escribir cada bloque en el mismo orden usado para asignar OffsetAbs
+            ' DATA: escribir cada bloque en el mismo orden usado para asignar OffsetAbs.
+            ' Each block is: [BSTRING bytes] [u32 decompSize, only if WantCompressed] [payload bytes].
+            ' Payload comes from PayloadSrc (stream-copy) or PayloadBytes (in-memory).
             output.Position = posFileData
             For Each p In orderedPairs
                 Dim key = PathUtil.JoinDirFile(p.Dir, p.Name)
                 Dim rec = recByKey(key)
-                If rec.Payload IsNot Nothing AndAlso rec.Payload.Length > 0 Then
-                    output.Write(rec.Payload, 0, rec.Payload.Length)
+
+                If rec.BstringBytes IsNot Nothing AndAlso rec.BstringBytes.Length > 0 Then
+                    output.Write(rec.BstringBytes, 0, rec.BstringBytes.Length)
+                End If
+                If rec.WantCompressed Then
+                    Dim u = BitConverter.GetBytes(rec.DecompSize)
+                    output.Write(u, 0, 4)
+                End If
+                If rec.PayloadSrc IsNot Nothing Then
+                    Ba2WriterCommon.StreamCopyExact(rec.PayloadSrc.SourceStream, rec.PayloadSrc.Offset, rec.PayloadSrc.Length, output)
+                ElseIf rec.PayloadBytes IsNot Nothing AndAlso rec.PayloadBytes.Length > 0 Then
+                    output.Write(rec.PayloadBytes, 0, rec.PayloadBytes.Length)
                 End If
             Next
         End Sub
 
+        ''' <summary>
+        ''' Per-entry write plan for the BSA two-pass layout. The first pass per entry computes
+        ''' SizeField + BstringBytes + payload identity. The third pass emits BSTRING + (u32
+        ''' decompSize if WantCompressed) + payload bytes, picking PayloadSrc (stream-copy) or
+        ''' PayloadBytes (in-memory) at write time.
+        ''' </summary>
+        Private NotInheritable Class BsaWriteRecord
+            Public Property SizeField As UInteger
+            Public Property OffsetAbs As UInteger
+            Public Property BlockBytesOnDisk As Long       ' total bytes of [BSTRING][u32?][payload] for offset advancement
+            Public Property BstringBytes As Byte()         ' precomputed length-prefix + dir + '\\' + filename (no NUL); empty if EmbedNames=false
+            Public Property WantCompressed As Boolean
+            Public Property DecompSize As UInteger         ' written as the u32 prefix when WantCompressed
+            Public Property PayloadBytes As Byte()         ' in-memory bytes (LZ4 frame or raw); used when PayloadSrc is null
+            Public Property PayloadSrc As PayloadStreamSource ' stream-copy source (mutually exclusive with PayloadBytes)
+        End Class
 
     End Class
 

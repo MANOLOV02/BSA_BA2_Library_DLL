@@ -1,96 +1,99 @@
-﻿Option Strict On
+Option Strict On
 Imports System.IO
-Imports System.Text
-Imports DirectXTexWrapperCLI   ' Loader.LoadTextures, TextureLoaded, TextureLevel
+Imports DirectXTexWrapperCLI   ' Loader.GetDdsMetadata, DdsMetadata
 
 Namespace BethesdaArchive.Core
 
     ''' <summary>
-    ''' Importa DDS y arma VirtualEntry para BA2 DX10 usando el wrapper DirectXTex.
-    ''' - Preserva compresión (useCompress:=True)
-    ''' - No fuerza OpenGL (forceOpenGL:=False)
-    ''' - Soporta cubemap (Faces=6, IsCubemap=True)
-    ''' - Concatena niveles en el orden del wrapper: [mip0_face0..N][mip1_face0..N]...
+    ''' Imports DDS files into VirtualEntry instances suitable for BA2 DX10 archives.
+    '''
+    ''' Contract for BA2 DX10 (FO4): VirtualEntry.Data carries the STRIPPED payload (mip data
+    ''' concatenated, no DDS header), and the explicit DX10 metadata (Width / Height / MipCount /
+    ''' DxgiFormat / IsCubemap / Faces) is populated on the entry. The writer NEVER parses the
+    ''' DDS header; the reader reconstructs it on extraction via Loader.EncodeDDSHeader.
+    '''
+    ''' BSA (SSE) does NOT use this importer — it stores DDS files verbatim (header included)
+    ''' as opaque bytes; callers should pass the full DDS as VirtualEntry.Data without going
+    ''' through SplitDdsBytes / FromDdsBytes.
     ''' </summary>
     Public NotInheritable Class Dx10Importer
-        Public Shared Function Concat(levels As IEnumerable(Of Byte())) As Byte()
-            If levels Is Nothing Then Throw New ArgumentNullException(NameOf(levels))
-            Dim total As Long = 0
-            For Each a In levels
-                If a Is Nothing Then Throw New InvalidDataException("Nivel nulo.")
-                total += a.Length
-            Next
-            If total > Integer.MaxValue Then Throw New InvalidDataException("Textura demasiado grande (overflow Int32).")
-            Dim blob As Byte() = New Byte(CInt(total) - 1) {}
-            Dim cur As Integer = 0
-            For Each a In levels
-                Buffer.BlockCopy(a, 0, blob, cur, a.Length)
-                cur += a.Length
-            Next
-            Return blob
+
+        ''' <summary>Returns True if the buffer starts with the DDS magic ("DDS ").</summary>
+        Public Shared Function HasDdsMagic(bytes As Byte()) As Boolean
+            Return bytes IsNot Nothing AndAlso
+                   bytes.Length >= 4 AndAlso
+                   bytes(0) = AscW("D"c) AndAlso
+                   bytes(1) = AscW("D"c) AndAlso
+                   bytes(2) = AscW("S"c) AndAlso
+                   bytes(3) = AscW(" "c)
         End Function
 
         ''' <summary>
-        ''' Crea un VirtualEntry DX10 a partir de un buffer DDS y una ruta relativa (dentro del BA2).
+        ''' Header-only DDS parse via DirectXTex's GetMetadataFromDDSMemory (μs-cost, no pixel
+        ''' decode, no allocs beyond the returned managed objects). Returns the DX10 metadata
+        ''' and the payload (DDS file bytes minus the header) ready for BA2 DX10 packaging.
         ''' </summary>
-        Public Shared Function FromDdsBytes(ddsBytes As Byte(), relativePath As String) As VirtualEntry
+        Public Shared Function SplitDdsBytes(ddsBytes As Byte()) As (Metadata As DdsMetadata, Payload As Byte())
             If ddsBytes Is Nothing OrElse ddsBytes.Length = 0 Then
                 Throw New ArgumentException("DDS vacío.", NameOf(ddsBytes))
             End If
+            If Not HasDdsMagic(ddsBytes) Then
+                Throw New InvalidDataException("DDS inválido: falta magic 'DDS '.")
+            End If
+
+            Dim md = Loader.GetDdsMetadata(ddsBytes)
+            If md Is Nothing OrElse Not md.Loaded Then
+                Throw New InvalidDataException("DDS inválido o formato no soportado.")
+            End If
+            If md.HeaderSize <= 0 OrElse md.HeaderSize > ddsBytes.Length Then
+                Throw New InvalidDataException("DDS truncado o header tamaño inválido.")
+            End If
+
+            Dim payloadLen As Integer = ddsBytes.Length - md.HeaderSize
+            Dim payload As Byte()
+            If payloadLen > 0 Then
+                payload = New Byte(payloadLen - 1) {}
+                Buffer.BlockCopy(ddsBytes, md.HeaderSize, payload, 0, payloadLen)
+            Else
+                payload = Array.Empty(Of Byte)()
+            End If
+            Return (md, payload)
+        End Function
+
+        ''' <summary>
+        ''' Builds a VirtualEntry for BA2 DX10 from a DDS buffer + relative path. The returned
+        ''' entry has Data = stripped payload and the DX10 metadata fields populated.
+        ''' </summary>
+        Public Shared Function FromDdsBytes(ddsBytes As Byte(), relativePath As String) As VirtualEntry
             If String.IsNullOrWhiteSpace(relativePath) Then
                 Throw New ArgumentException("relativePath requerido.", NameOf(relativePath))
             End If
 
-            ' 1) Cargar DDS con DirectXTex (preservando compresión)
-            Dim lst = Loader.LoadTextures(New Byte()() {ddsBytes}, useCompress:=True, forceOpenGL:=False)
-            If lst Is Nothing OrElse lst.Count <> 1 OrElse lst(0) Is Nothing OrElse Not lst(0).Loaded Then
-                Throw New InvalidDataException("No se pudo cargar DDS con DirectXTex (Loaded=False).")
-            End If
-            Dim tex = lst(0)
+            Dim split = SplitDdsBytes(ddsBytes)
+            Dim md = split.Metadata
+            Dim payload = split.Payload
 
-            ' 2) Validaciones de metadata
-            If tex.Miplevels <= 0 Then Throw New InvalidDataException("DDS sin mips válidos.")
-            If tex.Faces <= 0 Then Throw New InvalidDataException("DDS sin cantidad de caras válida.")
-            If tex.Levels Is Nothing OrElse tex.Levels.Count <> tex.Miplevels * tex.Faces Then
-                Throw New InvalidDataException("Cantidad de niveles inconsistente (mips*caras).")
-            End If
-            Dim level0 = tex.Levels(0)
-            If level0 Is Nothing OrElse level0.Data Is Nothing Then
-                Throw New InvalidDataException("Nivel 0 inválido.")
-            End If
-            If tex.IsCubemap AndAlso tex.Faces <> 6 Then
-                Throw New InvalidDataException("Cubemap inválido: Faces debe ser 6.")
-            End If
-
-            ' 3) Concatenar datos: [mip0_face0..Faces-1][mip1_face0..]...
-            Dim blob As Byte() = Dx10Importer.Concat(tex.Levels.Select(Function(l) l.Data))
-
-            ' 4) Separar directorio/archivo relativos (con '/')
             Dim dir As String = "", fileName As String = ""
             PathUtil.SplitDirFile(relativePath, dir, fileName)
             If String.IsNullOrWhiteSpace(fileName) Then
                 Throw New InvalidDataException("Nombre de archivo relativo inválido.")
             End If
 
-            ' 5) Armar VirtualEntry DX10
-            Dim ve As New VirtualEntry() With {
-              .Directory = dir,
-              .FileName = fileName,
-              .Data = blob,
-              .PreferCompress = True,          ' sin efecto en DX10, lo dejamos en True
-              .DxgiFormat = tex.DxgiCodeFinal, ' formato final reportado por DirectXTex
-              .Width = level0.Width,
-              .Height = level0.Height,
-              .MipCount = tex.Miplevels,
-              .IsCubemap = tex.IsCubemap,
-              .Faces = tex.Faces
+            Return New VirtualEntry() With {
+                .Directory = dir,
+                .FileName = fileName,
+                .Data = payload,                ' contract: stripped payload, no DDS header
+                .PreferCompress = True,         ' sin efecto en DX10, mantenido por compatibilidad
+                .DxgiFormat = md.DxgiFormat,
+                .Width = md.Width,
+                .Height = md.Height,
+                .MipCount = md.MipCount,
+                .IsCubemap = md.IsCubemap,
+                .Faces = md.Faces
             }
-            Return ve
         End Function
 
-        ''' <summary>
-        ''' Crea un VirtualEntry DX10 a partir de un archivo DDS en disco y un DataRoot (para la ruta relativa).
-        ''' </summary>
+        ''' <summary>Convenience wrapper that reads a DDS file from disk and forwards to FromDdsBytes.</summary>
         Public Shared Function FromDdsFile(ddsPath As String, dataRoot As String) As VirtualEntry
             If String.IsNullOrWhiteSpace(ddsPath) Then Throw New ArgumentException("ddsPath requerido.")
             If Not File.Exists(ddsPath) Then Throw New FileNotFoundException("DDS no encontrado.", ddsPath)
@@ -103,4 +106,3 @@ Namespace BethesdaArchive.Core
     End Class
 
 End Namespace
-
