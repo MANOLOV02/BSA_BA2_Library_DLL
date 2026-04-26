@@ -37,14 +37,20 @@ Namespace BethesdaArchive.Core
         Public Property BundleAlreadyCompressed As Boolean = False
 
         ' When deciding whether to add free entries (paths not yet present in any archive) to an
-        ' existing slot, the packager rewrites the slot only if the proposed bytes-to-add ratio
-        ' against the slot's current size is at least this value. Default 1.0 means: rewrite a
-        ' slot only if the new free content is at least as big as what the slot already contains.
-        ' Lower = more aggressive reuse (more rewrites of small slots). Higher = stricter reuse
-        ' (fewer rewrites, more new slots created). Anchored entries (paths already present in
-        ' the slot) bypass the threshold — that rewrite is mandatory to honor the no-duplicate
-        ' contract.
-        Public Property ReuseThreshold As Double = 1.0
+        ' existing slot, the packager rewrites the slot only when the slot's REAL free space
+        ' (MaxArchiveBytes - existing on-disk size) is at least this many bytes. Default 100 MB.
+        ' This is an absolute floor in bytes, not a ratio: the rule is "is there enough actual
+        ' room to be worth the I/O of rewriting?". Anchored entries (paths already present in
+        ' the slot) bypass this check — that rewrite is mandatory to honor the no-duplicate
+        ' contract regardless of how little room is left.
+        '
+        ' Examples (cap = 3 GB):
+        '   - slot at 1.2 GB → 1.8 GB free ≥ 100 MB → fill it (caller's free entries land here).
+        '   - slot at 2.5 GB → 500 MB free ≥ 100 MB → fill it (accept the 2.5 GB rewrite cost
+        '     to avoid creating an extra fragmented slot).
+        '   - slot at 2.95 GB → 50 MB free < 100 MB → leave it alone (rewriting 2.95 GB to
+        '     squeeze in 50 MB is not worth it; the entries go to a new slot instead).
+        Public Property MinFreeSpaceToFill As Long = 100L * 1024L * 1024L
 
         ' Callback invoked exactly once per NEW plugin slot that Pack creates. Signature is
         ' (pluginFilePath, game). The caller is expected to write the dummy plugin file at that
@@ -355,9 +361,10 @@ Namespace BethesdaArchive.Core
                 proposedFreeEntries(chosen).Add(ve)
             Next
 
-            ' --- PHASE 3: validate reuse threshold per slot --------------------------------------
-            ' For each slot that has free entries proposed but NO anchored entries, decide whether
-            ' the proposed free bytes justify rewriting the slot. If not, revert and redistribute.
+            ' --- PHASE 3: validate reuse against minimum-free-space rule -------------------------
+            ' For each slot that has free entries proposed but NO anchored entries, accept the
+            ' rewrite only if the slot has enough REAL free space (cap minus existing on-disk
+            ' size) to be worth the I/O cost. Anchored slots are always rewritten regardless.
             Dim toRevert As New List(Of VirtualEntry)()
             Dim rejectedSlots As New HashSet(Of PluginSlot)()
             For Each slot In slots.ToList()
@@ -375,21 +382,21 @@ Namespace BethesdaArchive.Core
                 ' Slot already being rewritten by anchor → free entries piggyback for free.
                 If hasAnyAnchor Then Continue For
 
-                ' Empty slot (just created in this Pack, or empty existing archive) → no rewrite
-                ' cost to amortize, accept everything.
+                ' Existing-archive footprint: sum across buckets. 0 = brand new slot created in
+                ' this Pack (no rewrite cost) → accept anything.
                 Dim totalExistingSize As Long = 0L
                 For Each b In buckets
                     totalExistingSize += slot.SizeByBucket(b)
                 Next
                 If totalExistingSize = 0L Then Continue For
 
-                ' Reuse threshold check: proposed free ≥ existing × threshold ?
-                Dim proposedTotal As Long = proposedFreeBytes(slot)
-                Dim required As Double = totalExistingSize * req.ReuseThreshold
-                If CDbl(proposedTotal) >= required Then Continue For
+                ' Real free space available in this slot at the cap. If below the configured
+                ' minimum, the rewrite cost (moving totalExistingSize bytes) doesn't justify
+                ' squeezing a tiny amount of new content in.
+                Dim freeSpace As Long = req.MaxArchiveBytes - totalExistingSize
+                If freeSpace >= req.MinFreeSpaceToFill Then Continue For
 
-                ' Doesn't justify reuse — revert this slot's free proposals and exclude the slot
-                ' from the redistribution pass.
+                ' Not enough room to be worth it — revert this slot's free proposals.
                 toRevert.AddRange(freeList)
                 proposedFreeBytes(slot) = 0L
                 proposedFreeEntries(slot).Clear()
@@ -608,11 +615,78 @@ Namespace BethesdaArchive.Core
                         Dim ve As VirtualEntry = Nothing
                         If Not newByPath.TryGetValue(p, ve) Then Continue For
 
-                        Dim newDataLen As Integer = If(ve.Data Is Nothing, 0, ve.Data.Length)
-                        Dim existingBytes = reader.ExtractToMemory(ae.Index)
-                        Dim existingLen As Integer = If(existingBytes Is Nothing, 0, existingBytes.Length)
+                        ' Determine the "logical decompressed size" of the bundle entry — the
+                        ' field we can compare against the source archive's stored decomp size
+                        ' without ever decompressing. PreCompressed entries (the caller already
+                        ' compressed) report PreCompressedDecompSize. Legacy entries with raw
+                        ' Data report Data.Length.
+                        Dim newDecompSize As Long
+                        If ve.PreCompressed Then
+                            newDecompSize = CLng(ve.PreCompressedDecompSize)
+                        ElseIf ve.Data IsNot Nothing Then
+                            newDecompSize = ve.Data.LongLength
+                        Else
+                            newDecompSize = 0L
+                        End If
 
-                        If existingLen = newDataLen AndAlso Ba2WriterCommon.Crc32Bytes(existingBytes) = ve.Crc32 Then
+                        ' Cheap first check: extract the raw stored chunk (no decompression) so we
+                        ' can read the existing entry's decompressed size from the chunk header.
+                        ' If the sizes don't match, the content has changed for sure — no need
+                        ' to actually decompress to find out.
+                        Dim raw As RawCompressedEntry
+                        Try
+                            raw = reader.ExtractCompressedPayload(ae.Index)
+                        Catch
+                            ' Some readers can't supply ExtractCompressedPayload (multi-chunk,
+                            ' BSA edge cases). Treat as "changed" — forces a rewrite, which is
+                            ' the safe direction.
+                            changedAny = True
+                            Continue For
+                        End Try
+
+                        If CLng(raw.DecompSize) <> newDecompSize Then
+                            changedAny = True
+                            Continue For
+                        End If
+
+                        ' Sizes match — verify content via CRC32 of the decompressed payload.
+                        ' Do this only when the caller filled ve.Crc32 (otherwise we can't tell
+                        ' identity cheaply, fall back to "changed" to be safe).
+                        If ve.Crc32 = 0UI Then
+                            changedAny = True
+                            Continue For
+                        End If
+
+                        ' Decompress raw.Bytes manually so we get the EXACT payload that the
+                        ' caller compressed and CRC'd, without any header reconstruction the
+                        ' archive's high-level Extract path may apply (e.g. BA2 DX10 prepends a
+                        ' rebuilt DDS header on ExtractToMemory). The caller's ve.Crc32 is over
+                        ' the stripped/raw payload — we need the same shape on this side.
+                        Dim payloadForCrc As Byte() = Nothing
+                        Try
+                            If raw.IsCompressed Then
+                                ' Compressed payload: raw.Bytes is the chunk's compressed stream,
+                                ' raw.DecompSize is the expected decompressed length. The codec
+                                ' is Zlib unless this is a BSA LZ4 entry or BA2 v3+LZ4 archive.
+                                ' We pick by trying Zlib first (most common for BA2 GNRL/DX10);
+                                ' if that fails, fall back to LZ4. Both decoders are strict.
+                                Try
+                                    payloadForCrc = ZlibStrict.ZlibDecompressStrict(raw.Bytes, CInt(raw.DecompSize))
+                                Catch
+                                    payloadForCrc = Lz4Strict.Lz4DecompressStrict(raw.Bytes, CInt(raw.DecompSize))
+                                End Try
+                            Else
+                                ' Stored uncompressed: raw.Bytes IS the payload.
+                                payloadForCrc = raw.Bytes
+                            End If
+                        Catch
+                            ' Decompression failed for any reason → can't verify identity, treat
+                            ' as changed (safe direction).
+                            changedAny = True
+                            Continue For
+                        End Try
+
+                        If payloadForCrc IsNot Nothing AndAlso Ba2WriterCommon.Crc32Bytes(payloadForCrc) = ve.Crc32 Then
                             result.UnchangedPaths.Add(p)
                         Else
                             changedAny = True
