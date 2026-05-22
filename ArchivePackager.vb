@@ -15,6 +15,16 @@ Namespace BethesdaArchive.Core
 
     Public NotInheritable Class PackagerRequest
         Public Property Game As GameKind
+
+        ' BA2 header version written for FO4 archives (GNRL + DX10). FO4-only: IGNORED when
+        ' Game = SSE_BSA (BSA is always v105). Valid values are the same the writers accept
+        ' (1/2/3/7/8); the writer throws on anything else. Default 8 = Next Gen, which is what
+        ' the writers default to — so existing callers are byte-for-byte unaffected.
+        '   - 8 (or 7): Next Gen format. Only the 1.10.980+ ("NG") Fallout4.exe can load it.
+        '   - 1:        Old Gen / original format. Loads on BOTH OG and NG (universal). The NG
+        '               update only bumped this header field; the body is identical.
+        Public Property Ba2Version As UInteger = 8UI
+
         Public Property ModBaseName As String = "WM_ClonePack"
         Public Property OutputDir As String = ""
         Public Property Entries As List(Of VirtualEntry)
@@ -499,7 +509,7 @@ Namespace BethesdaArchive.Core
                 If sub_.Count = 0 Then Continue For
 
                 Dim archivePath = ArchivePathFor(slot, bucket, req.OutputDir)
-                PackOneArchive(archivePath, sub_, bucket, result)
+                PackOneArchive(archivePath, sub_, bucket, result, req.Ba2Version)
                 emittedAny = True
             Next
 
@@ -520,19 +530,20 @@ Namespace BethesdaArchive.Core
         Private Shared Sub PackOneArchive(archivePath As String,
                                           bundle As List(Of VirtualEntry),
                                           kind As BucketKind,
-                                          result As PackagerResult)
+                                          result As PackagerResult,
+                                          ba2Version As UInteger)
             EnsureDir(archivePath)
 
             ' Fast path: nothing on disk yet — write fresh.
             If Not File.Exists(archivePath) Then
-                WriteArchive(archivePath, bundle, kind)
+                WriteArchive(archivePath, bundle, kind, ba2Version)
                 VerifyArchive(archivePath, bundle)
                 result.Archives.Add(archivePath)
                 Return
             End If
 
             ' Diff against existing.
-            Dim diff = ComputeDiff(archivePath, bundle)
+            Dim diff = ComputeDiff(archivePath, bundle, ba2Version, kind)
             If diff.Kind = DiffKind.Unchanged Then
                 result.Skipped.Add(archivePath)
                 Return
@@ -552,7 +563,7 @@ Namespace BethesdaArchive.Core
                 Using fs = File.OpenRead(bakPath)
                     Using reader As New BethesdaReader(fs)
                         entriesToWrite = BuildEntriesToWrite(bundle, reader, diff)
-                        WriteArchive(archivePath, entriesToWrite, kind)
+                        WriteArchive(archivePath, entriesToWrite, kind, ba2Version)
                     End Using
                 End Using
 
@@ -581,7 +592,8 @@ Namespace BethesdaArchive.Core
         ' size + CRC32. CRC32 of existing entries forces a decompression pass — only paid once
         ' per Pack and only for paths that also appear in the bundle.
         ' --------------------------------------------------------------------------------------
-        Private Shared Function ComputeDiff(existingPath As String, bundle As List(Of VirtualEntry)) As DiffResult
+        Private Shared Function ComputeDiff(existingPath As String, bundle As List(Of VirtualEntry),
+                                            requestedBa2Version As UInteger, kind As BucketKind) As DiffResult
             Dim result As New DiffResult() With {.Kind = DiffKind.NeedsRewrite}
 
             Dim newByPath As New Dictionary(Of String, VirtualEntry)(StringComparer.OrdinalIgnoreCase)
@@ -591,6 +603,16 @@ Namespace BethesdaArchive.Core
 
             Using fs = File.OpenRead(existingPath)
                 Using reader As New BethesdaReader(fs)
+                    ' Force a rewrite when the on-disk BA2 header version differs from the requested
+                    ' one, even if every entry is byte-identical. Without this, switching the version
+                    ' selector (e.g. NG v8 → OG v1) on an already-packed set would be skipped as
+                    ' "Unchanged" and the archive would keep its old version. BSA has no version
+                    ' choice (Ba2HeaderVersion = Nothing) so it never triggers a mismatch.
+                    Dim versionMismatch As Boolean =
+                        (kind = BucketKind.BA2_GNRL OrElse kind = BucketKind.BA2_DX10) AndAlso
+                        reader.Ba2HeaderVersion.HasValue AndAlso
+                        reader.Ba2HeaderVersion.Value <> requestedBa2Version
+
                     Dim existingPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
                     For Each ae In reader.EntriesFiles
                         existingPaths.Add(NormalizePath(ae.FullPath))
@@ -696,7 +718,7 @@ Namespace BethesdaArchive.Core
                     ' Skip rewrite only if the bundle is fully covered by unchanged entries AND
                     ' nothing in the bundle is missing from the archive. Preserved paths alone
                     ' don't need a rewrite — they're already on disk.
-                    If Not addedAny AndAlso Not changedAny Then
+                    If Not addedAny AndAlso Not changedAny AndAlso Not versionMismatch Then
                         result.Kind = DiffKind.Unchanged
                     End If
                 End Using
@@ -776,13 +798,13 @@ Namespace BethesdaArchive.Core
         ' --------------------------------------------------------------------------------------
         ' Writer dispatch by bucket. Options use library defaults — Pack does not expose them yet.
         ' --------------------------------------------------------------------------------------
-        Private Shared Sub WriteArchive(path As String, entries As List(Of VirtualEntry), kind As BucketKind)
+        Private Shared Sub WriteArchive(path As String, entries As List(Of VirtualEntry), kind As BucketKind, ba2Version As UInteger)
             Using fs As FileStream = File.Create(path)
                 Select Case kind
                     Case BucketKind.BA2_GNRL
-                        Ba2WriterGNRL.Write(fs, entries, New Ba2WriterGNRL.Options())
+                        Ba2WriterGNRL.Write(fs, entries, New Ba2WriterGNRL.Options With {.Version = ba2Version})
                     Case BucketKind.BA2_DX10
-                        Ba2WriterDX10.Write(fs, entries, New Ba2WriterDX10.Options())
+                        Ba2WriterDX10.Write(fs, entries, New Ba2WriterDX10.Options With {.Version = ba2Version})
                     Case BucketKind.BSA
                         BsaWriter.Write(fs, entries, New BsaWriter.Options())
                     Case Else

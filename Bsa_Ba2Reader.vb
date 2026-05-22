@@ -55,6 +55,15 @@ Namespace BethesdaArchive.Core
             Return _impl.GetPayloadSourceByIndex(index)
         End Function
 
+        ''' <summary>BA2 header version (1/2/3/7/8) when this is a BA2 archive; Nothing for BSA.
+        ''' The packager uses it to force a rewrite when the on-disk version differs from the
+        ''' requested one even though the content is byte-identical.</summary>
+        Public ReadOnly Property Ba2HeaderVersion As UInteger?
+            Get
+                Return _impl.Ba2HeaderVersion
+            End Get
+        End Property
+
         Private Shared Function DetectAndOpen(fs As Stream, enc As Encoding) As IArchiveImpl
             If Not fs.CanSeek Then Throw New ArgumentException("El Stream debe soportar Seek")
             Dim start = fs.Position
@@ -106,6 +115,9 @@ Namespace BethesdaArchive.Core
         Function ExtractByIndex(index As Integer) As Byte()
         Function ExtractRawByIndex(index As Integer) As RawCompressedEntry
         Function GetPayloadSourceByIndex(index As Integer) As PayloadStreamSource
+        ''' <summary>BA2 header version (1/2/3/7/8) for BA2 archives; Nothing for BSA (whose v105
+        ''' is a BSA version, not comparable to a BA2 version).</summary>
+        ReadOnly Property Ba2HeaderVersion As UInteger?
     End Interface
 
     ' ============ DECOMPRESSERS =============
@@ -605,6 +617,12 @@ Namespace BethesdaArchive.Core
                 .IsCompressed = r.Compressed
             }
         End Function
+
+        Public ReadOnly Property Ba2HeaderVersion As UInteger? Implements IArchiveImpl.Ba2HeaderVersion
+            Get
+                Return Nothing   ' BSA: not a BA2; v105 is a BSA version, not a BA2 header version.
+            End Get
+        End Property
 
         Public Sub Dispose() Implements IArchiveImpl.Dispose
             _br?.Dispose()
@@ -1119,6 +1137,12 @@ Namespace BethesdaArchive.Core
 
             Throw New NotSupportedException("BA2: tipo de entry no soportado por GetPayloadSource.")
         End Function
+
+        Public ReadOnly Property Ba2HeaderVersion As UInteger? Implements IArchiveImpl.Ba2HeaderVersion
+            Get
+                Return _hdr.Version
+            End Get
+        End Property
 
         Public Sub Dispose() Implements IArchiveImpl.Dispose
             _br?.Dispose()
