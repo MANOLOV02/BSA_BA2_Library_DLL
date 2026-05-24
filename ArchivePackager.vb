@@ -1,4 +1,4 @@
-Option Strict On
+﻿Option Strict On
 Imports System.IO
 
 Namespace BethesdaArchive.Core
@@ -160,7 +160,7 @@ Namespace BethesdaArchive.Core
         End Class
 
         Public Shared Function Pack(req As PackagerRequest) As PackagerResult
-            If req Is Nothing Then Throw New ArgumentNullException(NameOf(req))
+            ArgumentNullException.ThrowIfNull(req)
             If String.IsNullOrWhiteSpace(req.ModBaseName) Then Throw New ArgumentException("ModBaseName is empty.", NameOf(req))
             If String.IsNullOrWhiteSpace(req.OutputDir) Then Throw New ArgumentException("OutputDir is empty.", NameOf(req))
             If req.Entries Is Nothing Then Throw New ArgumentException("Entries is null.", NameOf(req))
@@ -955,7 +955,7 @@ Namespace BethesdaArchive.Core
                                        Optional onEntry As Action(Of Integer, Integer, String) = Nothing,
                                        Optional ct As System.Threading.CancellationToken = Nothing,
                                        Optional onArchiveStart As Action(Of String, Integer, Integer) = Nothing) As UnpackResult
-            If req Is Nothing Then Throw New ArgumentNullException(NameOf(req))
+            ArgumentNullException.ThrowIfNull(req)
             If String.IsNullOrWhiteSpace(req.OutputDir) Then Throw New ArgumentException("OutputDir is empty.", NameOf(req))
             If String.IsNullOrWhiteSpace(req.ModBaseName) Then Throw New ArgumentException("ModBaseName is empty.", NameOf(req))
             If String.IsNullOrWhiteSpace(req.LooseDataDir) Then Throw New ArgumentException("LooseDataDir is empty.", NameOf(req))

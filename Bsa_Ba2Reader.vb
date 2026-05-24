@@ -955,10 +955,11 @@ Namespace BethesdaArchive.Core
                             .DataFileIndex = dataFileIdx, .ChunkCount = chunkCount, .ChunkHeaderSize = chunkHdrSize
                         }
                         For c = 0 To e.ChunkCount - 1
-                            Dim ch As New EntryGNRL.Chunk
-                            ch.Offset = _br.ReadUInt64()           ' 8
-                            ch.CompressedSize = _br.ReadUInt32()   ' +4 = 12
-                            ch.DecompressedSize = _br.ReadUInt32() ' +4 = 16
+                            Dim ch As New EntryGNRL.Chunk With {
+                                .Offset = _br.ReadUInt64(),           ' 8
+                                .CompressedSize = _br.ReadUInt32(),   ' +4 = 12
+                                .DecompressedSize = _br.ReadUInt32() ' +4 = 16
+                                }
 
                             ' Sentinel SIEMPRE va inmediatamente después del header base.
                             Dim s As UInteger = _br.ReadUInt32()   ' +4 = 20 consumidos
@@ -976,25 +977,27 @@ Namespace BethesdaArchive.Core
                         If chunkHdrSize <> CUShort(24) AndAlso chunkHdrSize <> CUShort(20) Then
                             Throw New NotSupportedException($"BA2.DX10: chunk header size inesperado ({chunkHdrSize}).")
                         End If
+
                         Dim e As New EntryDX10 With {
                             .Index = CInt(i),
                             .HashFile = hashFile, .HashExt = hashExt, .HashDir = hashDir,
-                            .DataFileIndex = dataFileIdx, .ChunkCount = chunkCount, .ChunkHeaderSize = chunkHdrSize
+                            .DataFileIndex = dataFileIdx, .ChunkCount = chunkCount, .ChunkHeaderSize = chunkHdrSize,
+                            .Height = _br.ReadUInt16(),
+                            .Width = _br.ReadUInt16(),
+                            .MipCount = _br.ReadByte(),
+                            .DxgiFormatU8 = _br.ReadByte(),
+                            .Flags = _br.ReadByte(),
+                            .TileMode = _br.ReadByte()
                         }
-                        e.Height = _br.ReadUInt16()
-                        e.Width = _br.ReadUInt16()
-                        e.MipCount = _br.ReadByte()
-                        e.DxgiFormatU8 = _br.ReadByte()
-                        e.Flags = _br.ReadByte()
-                        e.TileMode = _br.ReadByte()
 
                         For c = 0 To e.ChunkCount - 1
-                            Dim ch As New EntryDX10.Chunk
-                            ch.Offset = _br.ReadUInt64()           ' 8
-                            ch.CompressedSize = _br.ReadUInt32()   ' +4 = 12
-                            ch.DecompressedSize = _br.ReadUInt32() ' +4 = 16
-                            ch.MipFirst = _br.ReadUInt16()         ' +2 = 18
-                            ch.MipLast = _br.ReadUInt16()          ' +2 = 20
+                            Dim ch As New EntryDX10.Chunk With {
+                                .Offset = _br.ReadUInt64(),           ' 8
+                                .CompressedSize = _br.ReadUInt32(),   ' +4 = 12
+                                .DecompressedSize = _br.ReadUInt32(), ' +4 = 16
+                                .MipFirst = _br.ReadUInt16(),         ' +2 = 18
+                                .MipLast = _br.ReadUInt16()          ' +2 = 20
+                                }
 
                             Dim s As UInteger = &HBAADF00DUI
 

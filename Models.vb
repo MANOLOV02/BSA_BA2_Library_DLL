@@ -119,7 +119,7 @@ Namespace BethesdaArchive.Core
         Public ReadOnly Property Kind As GameKind
         Public ReadOnly Property SourcePath As String
         Public ReadOnly Property Encoding As Encoding
-        Public ReadOnly ChangeSet As ArchiveChangeSet = New ArchiveChangeSet()
+        Public ReadOnly ChangeSet As New ArchiveChangeSet()
         Public ReadOnly Entries As List(Of VirtualEntry)
 
         Public Sub New(kind As GameKind, sourcePath As String, encoding As Encoding, entries As List(Of VirtualEntry))

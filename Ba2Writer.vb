@@ -257,7 +257,7 @@ Namespace BethesdaArchive.Core
         ''' </summary>
         Public Shared Sub Write(output As Stream, entries As IEnumerable(Of VirtualEntry), opts As Options)
             If output Is Nothing OrElse Not output.CanWrite Then Throw New ArgumentException("Stream inválido.")
-            If entries Is Nothing Then Throw New ArgumentNullException(NameOf(entries))
+            ArgumentNullException.ThrowIfNull(entries)
             If opts Is Nothing Then opts = New Options()
 
             ' Validación versión/compresión (DX10 soporta v1,7,8 y también v2/v3 según C++; LZ4 solo v3)
@@ -311,25 +311,24 @@ Namespace BethesdaArchive.Core
                 Dim parent As String = "", stem As String = "", extNoDot As String = ""
                 Ba2WriterCommon.Fo4SplitPath(norm, parent, stem, extNoDot)
 
-                Dim fm As New FileMeta()
-                fm.Index = iFile
-                fm.HashFile = Ba2WriterCommon.Crc32Ascii(stem)
-                fm.HashDir = Ba2WriterCommon.Crc32Ascii(parent)
-                fm.HashExt = Ba2WriterCommon.PackExt(extNoDot)
-                fm.ModIndex = 0
-                fm.ChunkCount = 1
-                fm.ChunkHeaderSize = CUShort(24) ' DX10: 24 bytes (incluye sentinel)
-
                 ' Header DX10 por archivo
-                fm.Dx10_Width = CUShort(ve.Width)
-                fm.Dx10_Height = CUShort(ve.Height)
-                fm.Dx10_MipCount = CByte(ve.MipCount)
-                fm.Dx10_DxgiFormatU8 = CByte(ve.DxgiFormat And &HFF)
-                fm.Dx10_Flags = If(ve.IsCubemap, CByte(1), CByte(0))
-                fm.Dx10_TileMode = CByte(8) ' como en el C++
-
-                fm.Chunk_MipFirst = 0US
-                fm.Chunk_MipLast = CUShort(ve.MipCount - 1)
+                Dim fm As New FileMeta With {
+                    .Index = iFile,
+                    .HashFile = Ba2WriterCommon.Crc32Ascii(stem),
+                    .HashDir = Ba2WriterCommon.Crc32Ascii(parent),
+                    .HashExt = Ba2WriterCommon.PackExt(extNoDot),
+                    .ModIndex = 0,
+                    .ChunkCount = 1,
+                    .ChunkHeaderSize = CUShort(24), ' DX10: 24 bytes (incluye sentinel)
+                    .Dx10_Width = CUShort(ve.Width),
+                    .Dx10_Height = CUShort(ve.Height),
+                    .Dx10_MipCount = CByte(ve.MipCount),
+                    .Dx10_DxgiFormatU8 = CByte(ve.DxgiFormat And &HFF),
+                    .Dx10_Flags = If(ve.IsCubemap, CByte(1), CByte(0)),
+                    .Dx10_TileMode = CByte(8), ' como en el C++
+                    .Chunk_MipFirst = 0US,
+                    .Chunk_MipLast = CUShort(ve.MipCount - 1)
+                }
 
                 If ve.PayloadSource IsNot Nothing Then
                     ' Stream-copy from another archive — same Version + CompressionFormat assumed.
@@ -514,7 +513,7 @@ Namespace BethesdaArchive.Core
         ''' </summary>
         Public Shared Sub Write(output As Stream, entries As IEnumerable(Of VirtualEntry), opts As Options)
             If output Is Nothing OrElse Not output.CanWrite Then Throw New ArgumentException("Stream inválido.", NameOf(output))
-            If entries Is Nothing Then Throw New ArgumentNullException(NameOf(entries))
+            ArgumentNullException.ThrowIfNull(entries)
             If opts Is Nothing Then opts = New Options()
 
             Dim enc = If(opts.Encoding, Encoding.UTF8)
