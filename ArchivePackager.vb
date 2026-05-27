@@ -71,6 +71,19 @@ Namespace BethesdaArchive.Core
         Public Property PluginWriter As Action(Of String, GameKind)
 
         Public Property Overflow As ArchiveOverflowPolicy = ArchiveOverflowPolicy.SplitByPlugin
+
+        ' When True, DiscoverSlots returns ONLY the slot whose plugin name equals ModBaseName
+        ' exactly (slot 1). Numbered companion plugins (<ModBaseName>2.esp, <ModBaseName>3.esp,
+        ' ...) are ignored even if they exist on disk — they are not considered for anchoring
+        ' nor for free-pass distribution, and their archives are never read or rewritten.
+        ' Combine with Overflow=ThrowOnExceed for "single archive set anchored to this exact
+        ' plugin, never spawn or touch numbered companions" semantics.
+        '
+        ' Default False preserves the WM_ClonePack flow (numbered companion plugins are part
+        ' of the design there). NPC_Manager sets True so its Save ESP only ever owns its own
+        ' "<plugin> - Main.ba2" + "<plugin> - Textures.ba2" pair and leaves any prior
+        ' numbered slots from previous experiments untouched.
+        Public Property SingleAnchorOnly As Boolean = False
     End Class
 
     Public NotInheritable Class PackagerResult
@@ -229,6 +242,9 @@ Namespace BethesdaArchive.Core
             For Each pluginPath In Directory.EnumerateFiles(req.OutputDir, req.ModBaseName & "*.esp", SearchOption.TopDirectoryOnly)
                 Dim slotNumber = ParseSlotNumber(Path.GetFileNameWithoutExtension(pluginPath), req.ModBaseName)
                 If slotNumber <= 0 Then Continue For
+                ' SingleAnchorOnly: ignore numbered companion slots (slot >= 2). Caller wants this
+                ' Pack to own only the exact-name plugin's archive set and leave the rest alone.
+                If req.SingleAnchorOnly AndAlso slotNumber <> 1 Then Continue For
 
                 Dim slot As New PluginSlot With {
                     .SlotNumber = slotNumber,
