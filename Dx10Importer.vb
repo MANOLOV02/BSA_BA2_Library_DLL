@@ -99,7 +99,9 @@ Namespace BethesdaArchive.Core
             If Not File.Exists(ddsPath) Then Throw New FileNotFoundException("DDS no encontrado.", ddsPath)
 
             Dim bytes = File.ReadAllBytes(ddsPath)
-            Dim rel As String = PathUtil.MakeRelativeUnderDataRoot(dataRoot, ddsPath)
+            ' Signature is MakeRelativeUnderDataRoot(absPath, dataRoot): the absolute DDS path
+            ' first, the data root second. (Previously these were swapped.)
+            Dim rel As String = PathUtil.MakeRelativeUnderDataRoot(ddsPath, dataRoot)
             Return FromDdsBytes(bytes, rel)
         End Function
 

@@ -1,4 +1,5 @@
-﻿' Version Uploaded of Wardrobe 2.1.3
+﻿Option Strict On
+' Version Uploaded of Wardrobe 2.1.3
 Imports System.IO
 Imports System.Runtime
 Imports System.Text
@@ -67,18 +68,17 @@ Namespace BethesdaArchive.Core
         Private Shared Function DetectAndOpen(fs As Stream, enc As Encoding) As IArchiveImpl
             If Not fs.CanSeek Then Throw New ArgumentException("El Stream debe soportar Seek")
             Dim start = fs.Position
+            ' BA2-016: single 4-byte magic read, then compare both ways (was: ASCII for BA2,
+            ' ReadUInt32 for BSA). Detection only — no bytes are written; the chosen impl is
+            ' identical. BA2 "BTDX" = 42 54 44 58; BSA "BSA\0" = 42 53 41 00 (u32 LE 0x00415342).
             Using br As New BinaryReader(fs, enc, leaveOpen:=True)
-                ' BA2: "BTDX"
                 If fs.Length - fs.Position >= 4 Then
-                    Dim m = Encoding.ASCII.GetString(br.ReadBytes(4))
+                    Dim magicBytes = br.ReadBytes(4)
                     fs.Position = start
-                    If m = "BTDX" Then Return New Ba2Impl(fs, enc)
-                End If
-                ' BSA: 0x00415342 = "BSA\0"
-                If fs.Length - fs.Position >= 4 Then
-                    Dim magic = br.ReadUInt32()
-                    fs.Position = start
-                    If magic = &H415342UI Then Return New BsaImpl(fs, enc)
+                    ' BA2: "BTDX" (ASCII), same comparison as before.
+                    If Encoding.ASCII.GetString(magicBytes) = "BTDX" Then Return New Ba2Impl(fs, enc)
+                    ' BSA: u32 LE 0x00415342, same comparison as before.
+                    If BitConverter.ToUInt32(magicBytes, 0) = &H415342UI Then Return New BsaImpl(fs, enc)
                 End If
             End Using
             Throw New InvalidDataException("Formato no reconocido (BSA SSE o BA2 FO4).")
@@ -213,7 +213,7 @@ Namespace BethesdaArchive.Core
         ''' Descomprime un stream ZLIB (RFC1950) de forma estricta:
         ''' - Verifica header CMF/FLG (CM=8 y (CMF<<8+FLG) mod 31 == 0).
         ''' - Descomprime con header y Adler-32.
-        ''' - Exige que el output tenga exactamente 'expected' bytes y que no queden bytes sin consumir.
+        ''' - Exige que el output tenga exactamente 'expected' bytes (tamaño del chunk header).
         ''' </summary>
         Friend Function ZlibDecompressStrict(packed As Byte(), expected As Integer) As Byte()
             If expected <= 0 Then Throw New InvalidDataException("Zlib: 'expected' debe ser > 0.")
@@ -242,7 +242,14 @@ Namespace BethesdaArchive.Core
             If total <> expected Then
                 Throw New InvalidDataException($"Zlib: tamaño descomprimido {total} != esperado {expected}.")
             End If
-
+            ' NO chequear inflater.IsFinished acá. El chunk header del BA2 trae el tamaño descomprimido
+            ' EXACTO, así que el truncamiento ya está cubierto arriba (total <> expected). El inflater se
+            ' detiene a propósito en 'expected' bytes de OUTPUT, ANTES de consumir el trailer Adler-32 del
+            ' zlib, por lo que IsFinished es legítimamente False para chunks FO4 VÁLIDOS. Un
+            ' "If Not IsFinished Then Throw" (intento BA2-005) rechazaba entradas reales de
+            ' Fallout4 - Animations.ba2 — verificado 2026-06-13 con Tools/StateInfoOffsetProbe (todos los
+            ' extract de behavior .hkx lanzaban antes del revert). Formato length-prefixed → el check de
+            ' longitud es el guard correcto, no IsFinished.
             Return outBytes
         End Function
 
@@ -492,7 +499,9 @@ Namespace BethesdaArchive.Core
                     Throw New EndOfStreamException("BSA: nombre embebido excede el archivo.")
                 End If
                 If nameLen > 0 Then _fs.Position += nameLen
-                ' Descontar: byte de longitud + bytes del nombre
+                ' Descontar: byte de longitud + bytes del nombre. Validar en Long para no
+                ' underflowear el UInteger si el header trae un tamaño inválido.
+                If CLng(sizeWork) < CLng(nameLen + 1) Then Throw New InvalidDataException("BSA: tamaño de entrada inválido")
                 sizeWork -= CUInt(nameLen + 1)
             End If
 
@@ -542,6 +551,8 @@ Namespace BethesdaArchive.Core
                     Throw New EndOfStreamException("BSA: nombre embebido excede el archivo.")
                 End If
                 If nameLen > 0 Then _fs.Position += nameLen
+                ' Validar en Long antes de restar para no underflowear el UInteger.
+                If CLng(sizeWork) < CLng(nameLen + 1) Then Throw New InvalidDataException("BSA: tamaño de entrada inválido")
                 sizeWork -= CUInt(nameLen + 1)
             End If
 
@@ -614,7 +625,8 @@ Namespace BethesdaArchive.Core
                 .Offset = cursor,
                 .Length = sizeWork,
                 .DecompSize = If(r.Compressed, CLng(decompSize), sizeWork),
-                .IsCompressed = r.Compressed
+                .IsCompressed = r.Compressed,
+                .SourceCodec = If(r.Compressed, PayloadCodec.Lz4Frame, PayloadCodec.None)
             }
         End Function
 
@@ -706,6 +718,11 @@ Namespace BethesdaArchive.Core
                             Throw New InvalidDataException($"BA2.GNRL: tamaño de chunk excede Int32 (need={needUL}).")
                         End If
                         Dim need As Integer = CInt(needUL)
+                        ' Verificar el rango completo [Offset, Offset+need) (no solo el inicio) en Long
+                        ' para no leer fuera del archivo si el header trae un tamaño corrupto.
+                        If CLng(ch.Offset) + CLng(need) > fs.Length Then
+                            Throw New InvalidDataException($"BA2.GNRL: chunk excede el archivo (offset={ch.Offset}, need={need}).")
+                        End If
 
                         Dim packed As Byte() = If(need > 0, New Byte(need - 1) {}, Array.Empty(Of Byte)())
                         If need > 0 Then ReadExact(fs, packed, 0, need)
@@ -760,6 +777,10 @@ Namespace BethesdaArchive.Core
                 End If
 
                 Dim need As Integer = CInt(needUL)
+                ' Verificar el rango completo [Offset, Offset+need) en Long antes de leer.
+                If CLng(ch.Offset) + CLng(need) > fs.Length Then
+                    Throw New InvalidDataException($"BA2.GNRL: chunk excede el archivo (offset={ch.Offset}, need={need}).")
+                End If
                 Dim packed As Byte() = If(need > 0, New Byte(need - 1) {}, Array.Empty(Of Byte)())
                 If need > 0 Then ReadExact(fs, packed, 0, need)
 
@@ -823,6 +844,12 @@ Namespace BethesdaArchive.Core
                     ms.Write(ddsHeader, 0, ddsHeader.Length)
 
                     For Each ch In ordered
+                        ' Validar inicio y rango completo [Offset, Offset+need) en Long: estos
+                        ' chunks no traían guarda de offset y un header corrupto podía hacer
+                        ' Position/Read fuera del archivo.
+                        If CLng(ch.Offset) < 0 OrElse CLng(ch.Offset) >= fs.Length Then
+                            Throw New InvalidDataException($"BA2.DX10: offset fuera de rango (offset={ch.Offset}).")
+                        End If
                         fs.Position = CLng(ch.Offset)
                         Dim isComp As Boolean = (ch.CompressedSize <> 0UI)
                         Dim needUL As ULong = If(isComp, CULng(ch.CompressedSize), CULng(ch.DecompressedSize))
@@ -830,6 +857,9 @@ Namespace BethesdaArchive.Core
                             Throw New InvalidDataException($"BA2.DX10: tamaño de chunk excede Int32 (need={needUL}).")
                         End If
                         Dim need As Integer = CInt(needUL)
+                        If CLng(ch.Offset) + CLng(need) > fs.Length Then
+                            Throw New InvalidDataException($"BA2.DX10: chunk excede el archivo (offset={ch.Offset}, need={need}).")
+                        End If
 
                         Dim packed = If(need > 0, New Byte(need - 1) {}, Array.Empty(Of Byte)())
                         If need > 0 Then ReadExact(fs, packed, 0, need)
@@ -883,6 +913,10 @@ Namespace BethesdaArchive.Core
                 End If
 
                 Dim need As Integer = CInt(needUL)
+                ' Verificar el rango completo [Offset, Offset+need) en Long antes de leer.
+                If CLng(ch.Offset) + CLng(need) > fs.Length Then
+                    Throw New InvalidDataException($"BA2.DX10: chunk excede el archivo (offset={ch.Offset}, need={need}).")
+                End If
                 Dim packed As Byte() = If(need > 0, New Byte(need - 1) {}, Array.Empty(Of Byte)())
                 If need > 0 Then ReadExact(fs, packed, 0, need)
 
@@ -1106,7 +1140,8 @@ Namespace BethesdaArchive.Core
                     .Offset = CLng(ch.Offset),
                     .Length = If(isComp, CLng(ch.CompressedSize), CLng(ch.DecompressedSize)),
                     .DecompSize = CLng(ch.DecompressedSize),
-                    .IsCompressed = isComp
+                    .IsCompressed = isComp,
+                    .SourceCodec = If(isComp, Ba2ChunkCodec(_hdr), PayloadCodec.None)
                 }
             End If
 
@@ -1128,6 +1163,7 @@ Namespace BethesdaArchive.Core
                     .Length = If(isComp, CLng(ch.CompressedSize), CLng(ch.DecompressedSize)),
                     .DecompSize = CLng(ch.DecompressedSize),
                     .IsCompressed = isComp,
+                    .SourceCodec = If(isComp, Ba2ChunkCodec(_hdr), PayloadCodec.None),
                     .HasDx10Metadata = True,
                     .Width = CInt(ed.Width),
                     .Height = CInt(ed.Height),
@@ -1159,6 +1195,15 @@ Namespace BethesdaArchive.Core
                 read += n
             End While
         End Sub
+
+        ' Codec of a COMPRESSED BA2 chunk, derived from the header (mirrors Extract's branch):
+        ' v3 + V3_Compression=3 → LZ4 raw block; cualquier otra versión → zlib.
+        Private Shared Function Ba2ChunkCodec(hdr As Ba2Header) As PayloadCodec
+            If hdr.Version >= 3UI AndAlso hdr.V3_Compression = 3UI Then
+                Return PayloadCodec.Lz4Block
+            End If
+            Return PayloadCodec.Zlib
+        End Function
 
 
     End Class

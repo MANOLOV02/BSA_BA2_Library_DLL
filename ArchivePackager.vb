@@ -269,9 +269,18 @@ Namespace BethesdaArchive.Core
                                     Next
                                 End Using
                             End Using
-                        Catch
-                            ' Corrupt/unreadable archive: treat as empty for anchoring. PackOneArchive
-                            ' will fail more loudly later if it can't diff the file.
+                            ' Narrowed: only genuine format/parse failures mean "corrupt → treat as empty".
+                            ' EndOfStreamException (truncated header/table) derives from IOException but is
+                            ' a format problem, so it is caught explicitly here. A real IOException (file
+                            ' locked / in use) is intentionally NOT caught — it must propagate so the caller
+                            ' surfaces a true error instead of silently anchoring against an "empty" archive.
+                        Catch ex As InvalidDataException
+                            ' Unrecognized magic / bad BA2 or BSA structure → treat as empty for anchoring.
+                            ' PackOneArchive will fail more loudly later if it can't diff the file.
+                        Catch ex As EndOfStreamException
+                            ' Truncated header / file table → same as above.
+                        Catch ex As NotSupportedException
+                            ' Unsupported variant (GNMF, unexpected chunk header size, BSA != v105) → empty.
                         End Try
                     End If
                 Next
@@ -578,7 +587,7 @@ Namespace BethesdaArchive.Core
                 Dim entriesToWrite As List(Of VirtualEntry)
                 Using fs = File.OpenRead(bakPath)
                     Using reader As New BethesdaReader(fs)
-                        entriesToWrite = BuildEntriesToWrite(bundle, reader, diff)
+                        entriesToWrite = BuildEntriesToWrite(bundle, reader, diff, kind)
                         WriteArchive(archivePath, entriesToWrite, kind, ba2Version)
                     End Using
                 End Using
@@ -674,10 +683,17 @@ Namespace BethesdaArchive.Core
                         Dim raw As RawCompressedEntry
                         Try
                             raw = reader.ExtractCompressedPayload(ae.Index)
-                        Catch
-                            ' Some readers can't supply ExtractCompressedPayload (multi-chunk,
-                            ' BSA edge cases). Treat as "changed" — forces a rewrite, which is
-                            ' the safe direction.
+                        Catch ex As NotSupportedException
+                            ' Layout we can't replay verbatim (multi-chunk BA2, non-default tile mode,
+                            ' BSA edge cases). Treat as "changed" — forces a rewrite, the safe direction.
+                            changedAny = True
+                            Continue For
+                        Catch ex As InvalidDataException
+                            ' Corrupt chunk header (offset/size out of range) → treat as "changed".
+                            changedAny = True
+                            Continue For
+                        Catch ex As EndOfStreamException
+                            ' Truncated payload (short read while extracting the raw chunk) → "changed".
                             changedAny = True
                             Continue For
                         End Try
@@ -750,15 +766,38 @@ Namespace BethesdaArchive.Core
         '   - paths in diff.PreservePaths (existing in .bak but NOT in the bundle) → emit pass-through
         '     entry from .bak so the rewritten archive keeps everything that was already there.
         '     This is what makes Pack a merge ("upsert") instead of a destructive replace.
+        '
+        ' BA2-014 — single-chunk-only DX10 pass-through limitation:
+        '   Stream-copy pass-through (BuildPassThroughEntry) only works for entries the reader can
+        '   replay verbatim, i.e. SINGLE-CHUNK BA2 entries (and TileMode=8 for DX10). The library's
+        '   own writers always emit single-chunk entries, so archives this packager produced are
+        '   always pass-through-eligible. A MULTI-CHUNK DX10 texture (a large mip set split across
+        '   several chunks by an external tool such as Archive2/BSArch) CANNOT be lifted verbatim:
+        '   GetPayloadSource / ExtractCompressedPayload throw NotSupportedException for Chunks.Count<>1
+        '   (see Ba2Impl.EntryDX10.ExtractRaw / GetPayloadSourceByIndex).
+        '   How that plays out per path:
+        '     - UNCHANGED bundle entry: ComputeDiff's ExtractCompressedPayload throws → caught as
+        '       "changed" → the entry is forwarded as the bundle's own VirtualEntry and the DX10
+        '       writer RECOMPRESSES it as a single chunk. Never a verbatim copy.
+        '     - PRESERVED entry (in .bak, not in the bundle): PassThroughCodecSafe → GetPayloadSource
+        '       throws NotSupportedException, and the BuildRecompressEntry fallback ALSO calls
+        '       ExtractCompressedPayload, which throws too. So a multi-chunk DX10 preserve-path entry
+        '       would surface a hard error (rolled back by PackOneArchive), not a silent recompress.
+        '   In practice this packager only ever diffs/rewrites archives IT wrote (single-chunk by
+        '   construction), so multi-chunk DX10 never reaches these paths. The limitation is recorded
+        '   here so a future change that ingests externally-built multi-chunk DX10 archives knows it
+        '   must add a multi-chunk extract+recompress path before relying on pass-through.
         ' --------------------------------------------------------------------------------------
         Private Shared Function BuildEntriesToWrite(bundle As List(Of VirtualEntry),
                                                     bakReader As BethesdaReader,
-                                                    diff As DiffResult) As List(Of VirtualEntry)
+                                                    diff As DiffResult,
+                                                    kind As BucketKind) As List(Of VirtualEntry)
             Dim bakByPath As New Dictionary(Of String, ArchiveEntry)(StringComparer.OrdinalIgnoreCase)
             For Each ae In bakReader.EntriesFiles
                 bakByPath(NormalizePath(ae.FullPath)) = ae
             Next
 
+            Dim targetCodec As PayloadCodec = TargetCodecFor(kind)
             Dim out As New List(Of VirtualEntry)(bundle.Count + diff.PreservePaths.Count)
 
             ' First: bundle entries (each one keeps its order; unchanged ones get pass-through).
@@ -766,20 +805,54 @@ Namespace BethesdaArchive.Core
                 Dim p = NormalizePath(ve.FullPath)
                 Dim bakAe As ArchiveEntry = Nothing
                 If diff.UnchangedPaths.Contains(p) AndAlso bakByPath.TryGetValue(p, bakAe) Then
-                    out.Add(BuildPassThroughEntry(ve.Directory, ve.FileName, ve.PreferCompress, ve.Crc32, bakReader, bakAe.Index))
+                    ' Pass-through is byte-correct only when the .bak's codec matches the target.
+                    ' On a codec mismatch (e.g. a v3/LZ4 source rewritten as v8/Zlib) a verbatim
+                    ' stream-copy would corrupt the entry, so fall back to the bundle entry as-is
+                    ' and let the writer recompress with the target codec.
+                    If PassThroughCodecSafe(bakReader, bakAe.Index, targetCodec) Then
+                        out.Add(BuildPassThroughEntry(ve.Directory, ve.FileName, ve.PreferCompress, ve.Crc32, bakReader, bakAe.Index))
+                    Else
+                        out.Add(ve)
+                    End If
                 Else
                     out.Add(ve)
                 End If
             Next
 
-            ' Then: preserved entries (existing in .bak, not in the bundle). Always pass-through.
+            ' Then: preserved entries (existing in .bak, not in the bundle). Pass-through when the
+            ' codec matches; otherwise recompress from the .bak's decompressed payload (the bundle
+            ' has no copy of these, so we must re-extract them to re-encode safely).
             For Each pp In diff.PreservePaths
                 Dim bakAe As ArchiveEntry = Nothing
                 If Not bakByPath.TryGetValue(pp, bakAe) Then Continue For
-                out.Add(BuildPassThroughEntry(bakAe.Directory, bakAe.FileName, False, 0UI, bakReader, bakAe.Index))
+                If PassThroughCodecSafe(bakReader, bakAe.Index, targetCodec) Then
+                    out.Add(BuildPassThroughEntry(bakAe.Directory, bakAe.FileName, False, 0UI, bakReader, bakAe.Index))
+                Else
+                    out.Add(BuildRecompressEntry(bakAe.Directory, bakAe.FileName, bakReader, bakAe.Index))
+                End If
             Next
 
             Return out
+        End Function
+
+        ' Codec the writers emit for a bucket given how WriteArchive constructs Options: it sets
+        ' only .Version, so CompressionFormat stays the default Zip → BA2 always writes Zlib (even
+        ' v3, which is v3+Zip). The BSA writer always frames compressed payloads (Lz4Frame).
+        Private Shared Function TargetCodecFor(kind As BucketKind) As PayloadCodec
+            Select Case kind
+                Case BucketKind.BA2_GNRL, BucketKind.BA2_DX10 : Return PayloadCodec.Zlib
+                Case BucketKind.BSA : Return PayloadCodec.Lz4Frame
+                Case Else : Throw New ArgumentOutOfRangeException(NameOf(kind))
+            End Select
+        End Function
+
+        ' A stream-copy is byte-correct only when the source payload is either stored (no codec)
+        ' or encoded with the SAME codec the destination archive will declare. Anything else would
+        ' silently corrupt the entry, so we refuse and let the caller recompress instead.
+        Private Shared Function PassThroughCodecSafe(bakReader As BethesdaReader, bakIndex As Integer, targetCodec As PayloadCodec) As Boolean
+            Dim ps = bakReader.GetPayloadSource(bakIndex)
+            If Not ps.IsCompressed Then Return True               ' stored raw → always copy-safe
+            Return ps.SourceCodec = targetCodec
         End Function
 
         Private Shared Function BuildPassThroughEntry(dir As String,
@@ -807,6 +880,48 @@ Namespace BethesdaArchive.Core
                 ve.DxgiFormat = ps.DxgiFormat
                 ve.IsCubemap = ps.IsCubemap
                 ve.Faces = ps.Faces
+            End If
+            Return ve
+        End Function
+
+        ' Codec-mismatch fallback for a PRESERVED entry (one that exists only in .bak, with no
+        ' bundle copy to forward). We extract the entry's raw stored chunk, decompress it to the
+        ' stripped/decompressed payload, and hand that to the writer as plain Data so it recompresses
+        ' with the target codec. RawCompressedEntry.Bytes decodes to the exact stripped payload for
+        ' both GNRL and DX10 (no DDS header is reconstructed on this path), which is what the writers
+        ' expect on the non-pass-through branch.
+        Private Shared Function BuildRecompressEntry(dir As String,
+                                                      fileName As String,
+                                                      bakReader As BethesdaReader,
+                                                      bakIndex As Integer) As VirtualEntry
+            Dim raw = bakReader.ExtractCompressedPayload(bakIndex)
+            Dim payload As Byte()
+            If raw.IsCompressed Then
+                ' Source codec is non-target (that's why we're here). The strict decoders detect
+                ' their own format; try Zlib then LZ4, same as ComputeDiff's CRC path.
+                Try
+                    payload = ZlibStrict.ZlibDecompressStrict(raw.Bytes, CInt(raw.DecompSize))
+                Catch
+                    payload = Lz4Strict.Lz4DecompressStrict(raw.Bytes, CInt(raw.DecompSize))
+                End Try
+            Else
+                payload = raw.Bytes
+            End If
+
+            Dim ve As New VirtualEntry With {
+                .Directory = dir,
+                .FileName = fileName,
+                .Data = payload
+            }
+            ' DX10 entries need their metadata populated for the DX10 writer (it never parses a
+            ' DDS header on the Data path; the stripped payload + these fields are the contract).
+            If raw.HasDx10Metadata Then
+                ve.Width = raw.Width
+                ve.Height = raw.Height
+                ve.MipCount = raw.MipCount
+                ve.DxgiFormat = raw.DxgiFormat
+                ve.IsCubemap = raw.IsCubemap
+                ve.Faces = raw.Faces
             End If
             Return ve
         End Function
@@ -991,8 +1106,17 @@ Namespace BethesdaArchive.Core
                             totalEntries += reader.EntriesFiles.Count
                         End Using
                     End Using
-                Catch
-                    ' Corrupt archive: skip in count; the extraction loop below will surface the error.
+                    ' Narrowed to format/parse failures only. A locked-file IOException is NOT swallowed
+                    ' here: it propagates, which is correct — if the archive can't even be opened for the
+                    ' count pass, the extraction loop below would fail anyway, so surface it now. The
+                    ' genuine "corrupt archive" cases (bad magic / truncated table / unsupported variant)
+                    ' are skipped in the count; the extraction loop re-opens and surfaces the real error.
+                Catch ex As InvalidDataException
+                    ' Unrecognized magic / bad structure → skip in count.
+                Catch ex As EndOfStreamException
+                    ' Truncated header / file table → skip in count.
+                Catch ex As NotSupportedException
+                    ' Unsupported variant (GNMF, unexpected chunk header size, BSA != v105) → skip.
                 End Try
             Next
 

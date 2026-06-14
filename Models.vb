@@ -68,6 +68,14 @@ Namespace BethesdaArchive.Core
         Public Property DecompSize As Long
         Public Property IsCompressed As Boolean
 
+        ' Codec the source bytes are encoded with. A stream-copy pass-through is only byte-correct
+        ' when the destination archive uses the SAME codec — otherwise the copied bytes (e.g. an
+        ' LZ4 raw block) would land under a header that declares a different codec (e.g. Zlib) and
+        ' decode to garbage. The packager compares this against the target codec and falls back to
+        ' a full recompress when they differ. Stored (IsCompressed=False) entries carry no codec
+        ' and are always copy-safe → reported as None.
+        Public Property SourceCodec As PayloadCodec = PayloadCodec.None
+
         ' DX10 metadata, populated only when the source archive entry is BA2 DX10. Lets the
         ' writer rebuild the chunk header without reparsing the payload.
         Public Property HasDx10Metadata As Boolean
@@ -113,6 +121,23 @@ Namespace BethesdaArchive.Core
     Public Enum GameKind
         SSE_BSA
         FO4_BA2
+    End Enum
+
+    ''' <summary>
+    ''' Compression codec of a pre-encoded payload, used to decide whether a stream-copy
+    ''' pass-through is byte-correct between a source and destination archive.
+    '''   - None: the bytes are stored uncompressed (no codec) → always copy-safe.
+    '''   - Zlib: BA2 GNRL/DX10 zlib (RFC1950) chunk stream.
+    '''   - Lz4Block: BA2 v3 LZ4 raw block (no frame header).
+    '''   - Lz4Frame: BSA SSE LZ4 frame stream.
+    ''' Lz4Block and Lz4Frame are deliberately distinct: a BA2 v3 block cannot be copied into a
+    ''' BSA frame slot (or vice versa) without re-encoding.
+    ''' </summary>
+    Public Enum PayloadCodec
+        None
+        Zlib
+        Lz4Block
+        Lz4Frame
     End Enum
 
     Public NotInheritable Class ArchiveHandle

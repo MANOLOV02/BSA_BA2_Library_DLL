@@ -217,6 +217,83 @@ Namespace BethesdaArchive.Core
             WriteU32(s, code)
         End Sub
 
+        ' ====== Validación de versión/compresión compartida (GNRL + DX10) ======
+        ''' <summary>
+        ''' Valida Version (1/2/3/7/8) y la regla "LZ4 solo en v3", idéntica para GNRL y DX10.
+        ''' No escribe ningún byte. <paramref name="typeTag"/> ("GNRL"/"DX10") se usa solo para
+        ''' construir el mensaje de excepción con el mismo texto que tenía cada writer.
+        ''' </summary>
+        Friend Shared Sub ValidateVersionAndCompression(version As UInteger, compressionFormat As CompressionFormat, typeTag As String)
+            If version <> 1UI AndAlso version <> 2UI AndAlso version <> 3UI AndAlso version <> 7UI AndAlso version <> 8UI Then
+                Throw New InvalidDataException(typeTag & " admite Version=1,2,3,7,8.")
+            End If
+            If compressionFormat = CompressionFormat.Lz4 AndAlso version <> 3UI Then
+                Throw New InvalidDataException("LZ4 solo válido con BA2 Version=3.")
+            End If
+        End Sub
+
+        ' ====== Cabecera BA2 compartida (preamble v1/v2/v3/v7/v8) ======
+        ''' <summary>
+        ''' Escribe el preámbulo de cabecera BA2 común a GNRL y DX10 y devuelve por
+        ''' <paramref name="nameTableOffsetPatchPos"/> la posición del u64 NameTableOffset que el
+        ''' writer debe parchear al final. Secuencia EXACTA de bytes:
+        '''   [BTDX][u32 version][btdxType 4 bytes][u32 fileCount][u64 NameTableOffset=0 (patch)]
+        '''   (v2/v3) [u64 1]   (v3) [u32 compression_format]
+        ''' El orden, tipos, tamaños y endianness son los mismos que tenían los dos writers inline.
+        ''' </summary>
+        Friend Shared Sub WriteBa2Header(output As Stream,
+                                         btdxType As String,
+                                         fileCount As UInteger,
+                                         version As UInteger,
+                                         compressionFormat As CompressionFormat,
+                                         ByRef nameTableOffsetPatchPos As Long)
+            WriteAscii(output, "BTDX")
+            WriteU32(output, version)
+            WriteAscii(output, btdxType)
+            WriteU32(output, fileCount)
+            nameTableOffsetPatchPos = output.Position
+            WriteU64(output, 0UL)                 ' NameTableOffset (patch)
+            ' v2/v3: campo extra u64(1)
+            If version = 2UI OrElse version = 3UI Then
+                WriteU64(output, 1UL)
+            End If
+            ' v3: u32 compression_format (0=zip, 3=lz4)
+            If version = 3UI Then
+                WriteCompressionFormatV3(output, compressionFormat)
+            End If
+        End Sub
+
+        ' ====== Cola: tabla de nombres / string table (UTF-8, u16 length) ======
+        ''' <summary>
+        ''' Escribe la string table opcional (idéntica en GNRL y DX10) y parchea el u64
+        ''' NameTableOffset en <paramref name="nameTableOffsetPatchPos"/>. Cada nombre se emite como
+        ''' [u16 longitud][bytes UTF-8 (enc)] usando la ruta completa Directory\FileName ya
+        ''' normalizada. Cuando <paramref name="includeStrings"/> es False no escribe nada y deja el
+        ''' NameTableOffset en 0 (tal como lo escribió WriteBa2Header). Las posiciones se restauran
+        ''' al final para no alterar el cursor de salida.
+        ''' </summary>
+        Friend Shared Sub WriteStringTable(output As Stream,
+                                           includeStrings As Boolean,
+                                           enc As Encoding,
+                                           names As IEnumerable(Of String),
+                                           nameTableOffsetPatchPos As Long)
+            If Not includeStrings Then
+                ' Omitir string table → mantener NameTableOffset=0 (ya escrito) y no emitir nombres.
+                Return
+            End If
+            Dim nameTableOffset As ULong = CULng(output.Position)
+            For Each full In names
+                Dim nb = enc.GetBytes(full)
+                If nb.Length > UShort.MaxValue Then Throw New InvalidDataException("Nombre demasiado largo para string table (u16).")
+                WriteU16(output, CUShort(nb.Length))
+                output.Write(nb, 0, nb.Length)
+            Next
+            Dim savePos As Long = output.Position
+            output.Position = nameTableOffsetPatchPos
+            WriteU64(output, nameTableOffset)
+            output.Position = savePos
+        End Sub
+
     End Class
 
     ''' <summary>
@@ -260,13 +337,9 @@ Namespace BethesdaArchive.Core
             ArgumentNullException.ThrowIfNull(entries)
             If opts Is Nothing Then opts = New Options()
 
-            ' Validación versión/compresión (DX10 soporta v1,7,8 y también v2/v3 según C++; LZ4 solo v3)
-            If opts.Version <> 1UI AndAlso opts.Version <> 2UI AndAlso opts.Version <> 3UI AndAlso opts.Version <> 7UI AndAlso opts.Version <> 8UI Then
-                Throw New InvalidDataException("DX10 admite Version=1,2,3,7,8.")
-            End If
-            If opts.CompressionFormat = Ba2WriterCommon.CompressionFormat.Lz4 AndAlso opts.Version <> 3UI Then
-                Throw New InvalidDataException("LZ4 solo válido con BA2 Version=3.")
-            End If
+            ' Validación versión/compresión (DX10 soporta v1,7,8 y también v2/v3 según C++; LZ4 solo v3).
+            ' Mismo punto lógico que antes: antes de preparar metadata/payloads y de escribir bytes.
+            Ba2WriterCommon.ValidateVersionAndCompression(opts.Version, opts.CompressionFormat, "DX10")
 
             Dim enc = If(opts.Encoding, Encoding.UTF8)
             Dim list = entries.ToList()
@@ -311,7 +384,19 @@ Namespace BethesdaArchive.Core
                 Dim parent As String = "", stem As String = "", extNoDot As String = ""
                 Ba2WriterCommon.Fo4SplitPath(norm, parent, stem, extNoDot)
 
-                ' Header DX10 por archivo
+                ' Header DX10 por archivo.
+                ' BA2-006 — single-chunk-cubre-todos-los-mips (supuesto del modelo single-chunk):
+                '   este writer emite SIEMPRE 1 chunk que cubre los mips 0..MipCount-1, así que
+                '   Chunk_MipFirst=0 / Chunk_MipLast=MipCount-1 (abajo) es correcto para los tres
+                '   sub-paths: fresh-compress arma el chunk desde el DDS completo; pass-through y
+                '   PreCompressed sólo se alimentan de archivos que ESTA librería escribió →
+                '   single-chunk-all-mips (ver BA2-014). VirtualEntry NO transporta el rango de mips
+                '   del chunk fuente, así que un entry DX10 single-chunk EXTERNO cuyo chunk cubriera un
+                '   SUB-RANGO (p.ej. mips 0..K con K<MipCount-1, patrón de streaming) sería re-etiquetado
+                '   aquí como 0..MipCount-1 (corrupción del rango). Hoy ese path es inalcanzable (BA2-014:
+                '   no se ingieren archivos externos multi/sub-chunk). Si en el futuro se ingieren, hay que
+                '   propagar Chunk_MipFirst/MipLast del chunk fuente por VirtualEntry ANTES de confiar en
+                '   el pass-through; no extender el modelo ahora (caso no alcanzable).
                 Dim fm As New FileMeta With {
                     .Index = iFile,
                     .HashFile = Ba2WriterCommon.Crc32Ascii(stem),
@@ -345,7 +430,7 @@ Namespace BethesdaArchive.Core
                     fm.Chunk_CompData = If(ve.PreCompressedBytes, Array.Empty(Of Byte)())
                 Else
                     ' raw is the stripped DDS payload (mips concatenated). Compress directly.
-                    If raw.Length > Integer.MaxValue Then Throw New InvalidDataException("DX10: archivo demasiado grande.")
+                    ' (raw.Length is Integer, so it can never exceed Integer.MaxValue — no size guard needed here.)
                     fm.Chunk_DecompSize = CUInt(raw.Length)
 
                     ' ZLIB bien formado (CMF/FLG + Adler-32). Si no mejora => store.
@@ -372,20 +457,9 @@ Namespace BethesdaArchive.Core
             Next
 
             ' ====== Header BA2 (v1/v2/v3/v7/v8) ======
-            Ba2WriterCommon.WriteAscii(output, "BTDX")
-            Ba2WriterCommon.WriteU32(output, CUInt(opts.Version)) ' V1/V7/V8
-            Ba2WriterCommon.WriteAscii(output, "DX10")
-            Ba2WriterCommon.WriteU32(output, CUInt(perFile.Count))
-            Dim posStringTableOffset As Long = output.Position
-            Ba2WriterCommon.WriteU64(output, 0UL)                 ' NameTableOffset (patch)
-            ' v2/v3: campo extra u64(1)
-            If opts.Version = 2UI OrElse opts.Version = 3UI Then
-                Ba2WriterCommon.WriteU64(output, 1UL)
-            End If
-            ' v3: u32 compression_format (0=zip, 3=lz4)
-            If opts.Version = 3UI Then
-                Ba2WriterCommon.WriteCompressionFormatV3(output, opts.CompressionFormat)
-            End If
+            ' Preámbulo compartido GNRL/DX10. Solo cambia el tag de tipo ("DX10") y el conteo.
+            Dim posStringTableOffset As Long
+            Ba2WriterCommon.WriteBa2Header(output, "DX10", CUInt(perFile.Count), CUInt(opts.Version), opts.CompressionFormat, posStringTableOffset)
 
             ' ====== File headers + chunk entries (DX10) ======
             Dim patchOffsetPositions As New List(Of Long)(perFile.Count)
@@ -441,22 +515,11 @@ Namespace BethesdaArchive.Core
             Next
 
             ' ====== String table (UTF-8, u16 length) opcional ======
-            If opts.IncludeStrings Then
-                Dim stringTableOffset As ULong = CULng(output.Position)
-                For Each fm In perFile
-                    Dim full = PathUtil.JoinDirFile(fm.Directory, fm.FileName)
-                    Dim rawName = enc.GetBytes(full)
-                    If rawName.Length > UShort.MaxValue Then Throw New InvalidDataException("Nombre demasiado largo para string table (u16).")
-                    Ba2WriterCommon.WriteU16(output, CUShort(rawName.Length))
-                    output.Write(rawName, 0, rawName.Length)
-                Next
-                Dim savePos As Long = output.Position
-                output.Position = posStringTableOffset
-                Ba2WriterCommon.WriteU64(output, stringTableOffset)
-                output.Position = savePos
-            Else
-                ' Omitir string table → dejar NameTableOffset=0 (ya escrito) y no escribir nombres.
-            End If
+            ' Cola compartida GNRL/DX10: emite [u16 len][bytes] por nombre y parchea el NameTableOffset.
+            ' Las rutas se proyectan en el MISMO orden de iteración (perFile) que tenía el bucle inline.
+            Ba2WriterCommon.WriteStringTable(output, opts.IncludeStrings, enc,
+                                             perFile.Select(Function(fm) PathUtil.JoinDirFile(fm.Directory, fm.FileName)),
+                                             posStringTableOffset)
 
         End Sub
 
@@ -576,7 +639,7 @@ Namespace BethesdaArchive.Core
                     }
                 Else
                     Dim raw As Byte() = If(ve.Data, Array.Empty(Of Byte)())
-                    If raw.Length > Integer.MaxValue Then Throw New InvalidDataException("Archivo demasiado grande (GNRL).")
+                    ' (raw.Length is Integer, so it can never exceed Integer.MaxValue — no size guard needed here.)
 
                     ' Compresión según Version/CompressionFormat:
                     ' - v3 + LZ4 => LZ4 raw
@@ -610,29 +673,12 @@ Namespace BethesdaArchive.Core
             Next
 
             ' ===== Header BA2 (v1/v2/v3/v7/v8) =====
-            If opts.Version <> 1UI AndAlso opts.Version <> 2UI AndAlso opts.Version <> 3UI AndAlso opts.Version <> 7UI AndAlso opts.Version <> 8UI Then
-                Throw New InvalidDataException("GNRL admite Version=1,2,3,7,8.")
-            End If
-            If opts.CompressionFormat = Ba2WriterCommon.CompressionFormat.Lz4 AndAlso opts.Version <> 3UI Then
-                Throw New InvalidDataException("LZ4 solo válido con BA2 Version=3.")
-            End If
+            ' Mismo punto lógico que antes: tras preparar metadata, justo antes de escribir bytes.
+            Ba2WriterCommon.ValidateVersionAndCompression(opts.Version, opts.CompressionFormat, "GNRL")
 
-
-
-            Ba2WriterCommon.WriteAscii(output, "BTDX")
-            Ba2WriterCommon.WriteU32(output, opts.Version)
-            Ba2WriterCommon.WriteAscii(output, "GNRL")
-            Ba2WriterCommon.WriteU32(output, CUInt(metas.Count))
-            Dim posNameTable As Long = output.Position
-            Ba2WriterCommon.WriteU64(output, 0UL)                 ' NameTableOffset (patch)
-            ' v2/v3: campo extra u64(1)
-            If opts.Version = 2UI OrElse opts.Version = 3UI Then
-                Ba2WriterCommon.WriteU64(output, 1UL)
-            End If
-            ' v3: u32 compression_format (0=zip, 3=lz4)
-            If opts.Version = 3UI Then
-                Ba2WriterCommon.WriteCompressionFormatV3(output, opts.CompressionFormat)
-            End If
+            ' Preámbulo compartido GNRL/DX10. Solo cambia el tag de tipo ("GNRL") y el conteo.
+            Dim posNameTable As Long
+            Ba2WriterCommon.WriteBa2Header(output, "GNRL", CUInt(metas.Count), opts.Version, opts.CompressionFormat, posNameTable)
 
             ' ===== File headers + chunk headers =====
             Dim patchOffsets As New List(Of Long)(metas.Count)
@@ -673,22 +719,11 @@ Namespace BethesdaArchive.Core
             Next
 
             ' ===== Name table (UTF-8, u16 length) opcional =====
-            If opts.IncludeStrings Then
-                Dim nameTableOffset As ULong = CULng(output.Position)
-                For Each fm In metas
-                    Dim full = JoinDirFile(fm.Directory, fm.FileName)
-                    Dim nb = enc.GetBytes(full)
-                    If nb.Length > UShort.MaxValue Then Throw New InvalidDataException("Nombre demasiado largo (u16).")
-                    Ba2WriterCommon.WriteU16(output, CUShort(nb.Length))
-                    output.Write(nb, 0, nb.Length)
-                Next
-                Dim afterNames As Long = output.Position
-                output.Position = posNameTable
-                Ba2WriterCommon.WriteU64(output, nameTableOffset)
-                output.Position = afterNames
-            Else
-                ' Omitir string table → mantener NameTableOffset=0 y no emitir nombres.
-            End If
+            ' Cola compartida GNRL/DX10: emite [u16 len][bytes] por nombre y parchea el NameTableOffset.
+            ' Las rutas se proyectan en el MISMO orden de iteración (metas) que tenía el bucle inline.
+            Ba2WriterCommon.WriteStringTable(output, opts.IncludeStrings, enc,
+                                             metas.Select(Function(fm) PathUtil.JoinDirFile(fm.Directory, fm.FileName)),
+                                             posNameTable)
 
         End Sub
 
