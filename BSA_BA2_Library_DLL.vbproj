@@ -6,9 +6,8 @@
     <StartupObject>Sub Main</StartupObject>
     <UseWindowsForms>true</UseWindowsForms>
     <MyType>WindowsForms</MyType>
-    <Configurations>Debug;Release;Publish</Configurations>
+    <Configurations>Debug;Release</Configurations>
     <Platforms>x86;x64</Platforms>
-   <PublishDir>bin\$(Configuration)\$(TargetFramework)\publish\</PublishDir>
   </PropertyGroup>
 
   <ItemGroup>
