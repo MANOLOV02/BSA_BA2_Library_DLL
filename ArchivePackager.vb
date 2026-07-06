@@ -84,6 +84,15 @@ Namespace BethesdaArchive.Core
         ' "<plugin> - Main.ba2" + "<plugin> - Textures.ba2" pair and leaves any prior
         ' numbered slots from previous experiments untouched.
         Public Property SingleAnchorOnly As Boolean = False
+
+        ' Optional set of archive entry paths (as stored inside the archive, e.g.
+        ' "Meshes\Actors\...\<id>.nif") to DROP from the output even though they exist in the previous
+        ' archive — i.e. NOT preserved by the merge. Used by the NPC "mark to delete" flow to strip a
+        ' removed NPC's stale FaceGen bake from the app's own target archive while leaving every other
+        ' entry intact. When an exclude path is present in the previous archive, that bucket is forced to
+        ' rewrite so the drop materializes even with no other changes. Nothing/empty = no exclusions
+        ' (existing callers unaffected). Case-insensitive; normalized the same way archive paths are.
+        Public Property ExcludePaths As HashSet(Of String) = Nothing
     End Class
 
     Public NotInheritable Class PackagerResult
@@ -182,7 +191,9 @@ Namespace BethesdaArchive.Core
             EnsureDir(req.OutputDir & Path.DirectorySeparatorChar)
 
             Dim result As New PackagerResult()
-            If req.Entries.Count = 0 Then Return result
+            ' Delete-only Pack: an empty bundle with ExcludePaths still runs (it strips the excluded entries
+            ' from the existing target archive). Only a truly empty request (no entries AND no exclusions) is a no-op.
+            If req.Entries.Count = 0 AndAlso (req.ExcludePaths Is Nothing OrElse req.ExcludePaths.Count = 0) Then Return result
 
             Dim buckets = BucketsForGame(req.Game)
 
@@ -531,10 +542,13 @@ Namespace BethesdaArchive.Core
             Dim emittedAny As Boolean = False
             For Each bucket In buckets
                 Dim sub_ As List(Of VirtualEntry) = slot.AssignedByBucket(bucket)
-                If sub_.Count = 0 Then Continue For
+                ' Process the bucket when it has new/changed entries OR when an ExcludePath targets an entry
+                ' that already exists in this bucket's archive (delete-only rewrite to strip it). Otherwise skip.
+                Dim hasExclusionsHere = BucketHasExclusions(req, slot, bucket)
+                If sub_.Count = 0 AndAlso Not hasExclusionsHere Then Continue For
 
                 Dim archivePath = ArchivePathFor(slot, bucket, req.OutputDir)
-                PackOneArchive(archivePath, sub_, bucket, result, req.Ba2Version)
+                PackOneArchive(archivePath, sub_, bucket, result, req.Ba2Version, req.ExcludePaths)
                 emittedAny = True
             Next
 
@@ -552,15 +566,30 @@ Namespace BethesdaArchive.Core
         ' Per-archive flow: diff vs existing → skip / rewrite. On rewrite, rename current to .bak,
         ' build the entry list (mixing pass-through + fresh), write, verify. Restore .bak on fail.
         ' --------------------------------------------------------------------------------------
+        ' True when any ExcludePath matches an entry that currently exists in this slot/bucket's archive —
+        ' so a delete-only rewrite is needed to strip it. Normalizes the exclude paths the same way archive
+        ' paths are stored (case + separator) before comparing against the discovered existing set.
+        Private Shared Function BucketHasExclusions(req As PackagerRequest, slot As PluginSlot, bucket As BucketKind) As Boolean
+            If req.ExcludePaths Is Nothing OrElse req.ExcludePaths.Count = 0 Then Return False
+            Dim existing As HashSet(Of String) = Nothing
+            If Not slot.ExistingByBucket.TryGetValue(bucket, existing) OrElse existing Is Nothing OrElse existing.Count = 0 Then Return False
+            For Each ex In req.ExcludePaths
+                If existing.Contains(NormalizePath(ex)) Then Return True
+            Next
+            Return False
+        End Function
+
         Private Shared Sub PackOneArchive(archivePath As String,
                                           bundle As List(Of VirtualEntry),
                                           kind As BucketKind,
                                           result As PackagerResult,
-                                          ba2Version As UInteger)
+                                          ba2Version As UInteger,
+                                          Optional excludePaths As HashSet(Of String) = Nothing)
             EnsureDir(archivePath)
 
-            ' Fast path: nothing on disk yet — write fresh.
+            ' Fast path: nothing on disk yet — write fresh. (No existing entries → nothing to exclude.)
             If Not File.Exists(archivePath) Then
+                If bundle.Count = 0 Then Return   ' delete-only against a non-existent archive → no-op
                 WriteArchive(archivePath, bundle, kind, ba2Version)
                 VerifyArchive(archivePath, bundle)
                 result.Archives.Add(archivePath)
@@ -568,7 +597,7 @@ Namespace BethesdaArchive.Core
             End If
 
             ' Diff against existing.
-            Dim diff = ComputeDiff(archivePath, bundle, ba2Version, kind)
+            Dim diff = ComputeDiff(archivePath, bundle, ba2Version, kind, excludePaths)
             If diff.Kind = DiffKind.Unchanged Then
                 result.Skipped.Add(archivePath)
                 Return
@@ -585,12 +614,26 @@ Namespace BethesdaArchive.Core
                 ' runs: pass-through VirtualEntries hold PayloadSource references into _fs, and the
                 ' writer streams them directly with no intermediate buffering.
                 Dim entriesToWrite As List(Of VirtualEntry)
+                Dim emptiedByExclusion As Boolean = False
                 Using fs = File.OpenRead(bakPath)
                     Using reader As New BethesdaReader(fs)
                         entriesToWrite = BuildEntriesToWrite(bundle, reader, diff, kind)
-                        WriteArchive(archivePath, entriesToWrite, kind, ba2Version)
+                        ' Delete-only rewrite that emptied the archive (the excluded entries were its only
+                        ' content): drop the file entirely rather than writing a zero-entry archive. Deferred
+                        ' until after the reader/stream close below so the .bak isn't locked when deleted.
+                        If entriesToWrite.Count = 0 Then
+                            emptiedByExclusion = True
+                        Else
+                            WriteArchive(archivePath, entriesToWrite, kind, ba2Version)
+                        End If
                     End Using
                 End Using
+
+                If emptiedByExclusion Then
+                    If File.Exists(bakPath) Then File.Delete(bakPath)
+                    result.Skipped.Add(archivePath)
+                    Return
+                End If
 
                 ' Verify against the actual write (bundle ∪ preserved), not just the bundle —
                 ' otherwise preserved entries would be counted as "extra" and verification would fail.
@@ -618,13 +661,24 @@ Namespace BethesdaArchive.Core
         ' per Pack and only for paths that also appear in the bundle.
         ' --------------------------------------------------------------------------------------
         Private Shared Function ComputeDiff(existingPath As String, bundle As List(Of VirtualEntry),
-                                            requestedBa2Version As UInteger, kind As BucketKind) As DiffResult
+                                            requestedBa2Version As UInteger, kind As BucketKind,
+                                            Optional excludePaths As HashSet(Of String) = Nothing) As DiffResult
             Dim result As New DiffResult() With {.Kind = DiffKind.NeedsRewrite}
 
             Dim newByPath As New Dictionary(Of String, VirtualEntry)(StringComparer.OrdinalIgnoreCase)
             For Each ve In bundle
                 newByPath(NormalizePath(ve.FullPath)) = ve
             Next
+
+            ' Normalize the exclude set the same way archive paths are stored, so the drop matches regardless
+            ' of how the caller formatted the entry path (case / separators). Empty when no exclusions.
+            Dim normExclude As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+            If excludePaths IsNot Nothing Then
+                For Each ex In excludePaths
+                    If Not String.IsNullOrEmpty(ex) Then normExclude.Add(NormalizePath(ex))
+                Next
+            End If
+            Dim removedAny As Boolean = False
 
             Using fs = File.OpenRead(existingPath)
                 Using reader As New BethesdaReader(fs)
@@ -638,14 +692,45 @@ Namespace BethesdaArchive.Core
                         reader.Ba2HeaderVersion.HasValue AndAlso
                         reader.Ba2HeaderVersion.Value <> requestedBa2Version
 
+                    ' Self-heal gate: force a rewrite when any existing record carries a stale name/dir
+                    ' hash — i.e. the archive was written with the wrong hash algorithm (e.g. pre-fix BA2
+                    ' used zip-CRC32 instead of the engine's init=0/no-xor CRC), so the game can't find
+                    ' its files by hash. Payloads are byte-identical, so without this the diff would report
+                    ' Unchanged and the broken archive would survive every re-pack. Cheap: the stored hashes
+                    ' were already parsed at Open() (no payload I/O); Exit For on the first mismatch. Covers
+                    ' both paths — BA2 (32-bit FO4 hash) and BSA (64-bit TES4 hash).
+                    Dim staleHash As Boolean = False
+                    For Each ae In reader.EntriesFiles
+                        If kind = BucketKind.BA2_GNRL OrElse kind = BucketKind.BA2_DX10 Then
+                            Dim parent As String = "", stem As String = "", extNoDot As String = ""
+                            Ba2WriterCommon.Fo4SplitPath(ae.FullPath, parent, stem, extNoDot)
+                            If ae.Ba2NameHash <> Ba2WriterCommon.Fo4PathHash(stem) OrElse
+                               ae.Ba2DirHash <> Ba2WriterCommon.Fo4PathHash(parent) Then
+                                staleHash = True : Exit For
+                            End If
+                        ElseIf kind = BucketKind.BSA Then
+                            Dim expFile = BitConverter.ToUInt64(BsaWriter.BASTes4Hashing.Tes4HashFileBytes(ae.FileName), 0)
+                            Dim expDir = BitConverter.ToUInt64(BsaWriter.BASTes4Hashing.Tes4HashDirectoryBytes(ae.Directory), 0)
+                            If ae.BsaFileHash <> expFile OrElse ae.BsaDirHash <> expDir Then
+                                staleHash = True : Exit For
+                            End If
+                        End If
+                    Next
+
                     Dim existingPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
                     For Each ae In reader.EntriesFiles
                         existingPaths.Add(NormalizePath(ae.FullPath))
                     Next
 
-                    ' Existing paths NOT in the bundle are preserved (merge semantics).
+                    ' Existing paths NOT in the bundle are preserved (merge semantics) — UNLESS they are in the
+                    ' exclude set, in which case they are deliberately dropped (not preserved) and the presence of
+                    ' any such path forces a rewrite so the drop materializes even with no other change.
                     For Each ep In existingPaths
-                        If Not newByPath.ContainsKey(ep) Then result.PreservePaths.Add(ep)
+                        If normExclude.Contains(ep) Then
+                            removedAny = True
+                        ElseIf Not newByPath.ContainsKey(ep) Then
+                            result.PreservePaths.Add(ep)
+                        End If
                     Next
 
                     Dim addedAny As Boolean = False
@@ -748,9 +833,9 @@ Namespace BethesdaArchive.Core
                     Next
 
                     ' Skip rewrite only if the bundle is fully covered by unchanged entries AND
-                    ' nothing in the bundle is missing from the archive. Preserved paths alone
-                    ' don't need a rewrite — they're already on disk.
-                    If Not addedAny AndAlso Not changedAny AndAlso Not versionMismatch Then
+                    ' nothing in the bundle is missing from the archive AND nothing was excluded. Preserved
+                    ' paths alone don't need a rewrite — they're already on disk.
+                    If Not addedAny AndAlso Not changedAny AndAlso Not versionMismatch AndAlso Not removedAny AndAlso Not staleHash Then
                         result.Kind = DiffKind.Unchanged
                     End If
                 End Using

@@ -101,6 +101,14 @@ Namespace BethesdaArchive.Core
         '     of the payload, which Open() doesn't read). Reported as 0 in that case; callers
         '     that need an exact number must call ExtractCompressedPayload or ExtractToMemory.
         Public Property DecompressedSize As Long
+        ' Stored record hashes as they exist on disk — consumed by ArchivePackager.ComputeDiff to
+        ' detect archives written with a stale/wrong hash algorithm and force a rewrite even when the
+        ' payloads are byte-identical. BA2: 32-bit FO4 name/dir hash (0 for BSA). BSA: 64-bit TES4
+        ' file/folder hash (0 for BA2).
+        Public Property Ba2NameHash As UInteger
+        Public Property Ba2DirHash As UInteger
+        Public Property BsaFileHash As ULong
+        Public Property BsaDirHash As ULong
         Public ReadOnly Property FullPath As String
             Get
                 If String.IsNullOrEmpty(Directory) Then Return FileName
@@ -335,6 +343,8 @@ Namespace BethesdaArchive.Core
             Public SizeField As UInteger      ' con bits 30/31
             Public Compressed As Boolean
             Public HasEmbeddedName As Boolean ' <<< NUEVO
+            Public FileHash As ULong          ' hash TES4 de 64-bit del archivo (stored)
+            Public DirHash As ULong           ' hash TES4 de 64-bit de la carpeta (stored)
         End Class
 
         Public Sub New(fs As Stream, enc As Encoding)
@@ -390,10 +400,12 @@ Namespace BethesdaArchive.Core
             ' --- 1) Leer sólo los counts de carpetas ---
             _fs.Position = directoriesOffset
             Dim folderCounts As New List(Of UInteger)(CInt(_hdr.FolderCount))
+            Dim folderHashes As New List(Of ULong)(CInt(_hdr.FolderCount))
             For i = 0UI To _hdr.FolderCount - 1UI
                 Dim _hash = _br.ReadUInt64()
                 Dim cnt = _br.ReadUInt32()
                 folderCounts.Add(cnt)
+                folderHashes.Add(_hash)
                 _fs.Position += 12 ' resto del folder record v105 (0x18 total)
             Next
 
@@ -443,7 +455,8 @@ Namespace BethesdaArchive.Core
                     _records.Add(New FileRec With {
     .Index = idx, .Directory = dirName, .FileName = fileName,
     .Offset = offAbs, .SizeField = sizeField, .Compressed = comp,
-    .HasEmbeddedName = embedNames   ' <<< SIEMPRE según flag 0x100
+    .HasEmbeddedName = embedNames,   ' <<< SIEMPRE según flag 0x100
+    .FileHash = fhash, .DirHash = folderHashes(d)
 })
                     idx += 1
                 Next
@@ -474,7 +487,9 @@ Namespace BethesdaArchive.Core
                     .Index = r.Index,
                     .Directory = r.Directory,
                     .FileName = r.FileName,
-                    .DecompressedSize = decomp
+                    .DecompressedSize = decomp,
+                    .BsaFileHash = r.FileHash,
+                    .BsaDirHash = r.DirHash
                 })
             Next
             Return list
@@ -1091,24 +1106,29 @@ Namespace BethesdaArchive.Core
                 ' Sum chunk decompressed sizes — already parsed from the archive's per-file
                 ' chunk headers during Open(). Zero extra I/O.
                 Dim decomp As Long = 0
+                Dim nameHash As UInteger = 0UI, dirHash As UInteger = 0UI
                 Dim eg = TryCast(e, EntryGNRL)
                 If eg IsNot Nothing Then
                     For Each ch In eg.Chunks
                         decomp += CLng(ch.DecompressedSize)
                     Next
+                    nameHash = eg.HashFile : dirHash = eg.HashDir
                 Else
                     Dim ed = TryCast(e, EntryDX10)
                     If ed IsNot Nothing Then
                         For Each ch In ed.Chunks
                             decomp += CLng(ch.DecompressedSize)
                         Next
+                        nameHash = ed.HashFile : dirHash = ed.HashDir
                     End If
                 End If
                 list.Add(New ArchiveEntry With {
                     .Index = e.Index,
                     .Directory = e.Directory,
                     .FileName = e.FileName,
-                    .DecompressedSize = decomp
+                    .DecompressedSize = decomp,
+                    .Ba2NameHash = nameHash,
+                    .Ba2DirHash = dirHash
                 })
             Next
             Return list

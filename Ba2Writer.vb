@@ -45,6 +45,26 @@ Namespace BethesdaArchive.Core
             Return Crc32Bytes(Encoding.ASCII.GetBytes(text))
         End Function
 
+        ''' <summary>
+        ''' Hash FO4 de name/dir para los records del BA2. El engine busca cada archivo DENTRO del
+        ''' BA2 hasheando el path pedido y comparándolo contra HashFile/HashDir del record — así que
+        ''' DEBE usar exactamente este algoritmo, o todo lookup falla y el archive no aporta nada
+        ''' (síntoma: material y textura no cargan, sólo loose anda). Es CRC32 con la tabla zlib
+        ''' (poly 0xEDB88320) pero con init = 0 y SIN complemento final, sobre los bytes ASCII en
+        ''' minúscula. NO es el CRC32 zip estándar (init 0xFFFFFFFF + Not crc) que hace Crc32Bytes
+        ''' para el diff de payload. Verificado 5/5 contra vanilla (barnacle/default/keys/materials/
+        ''' gasolinecanister) y dirs anidados de Creation Club.
+        ''' </summary>
+        Friend Shared Function Fo4PathHash(text As String) As UInteger
+            Dim bytes = Encoding.ASCII.GetBytes(text.ToLowerInvariant())
+            Dim crc As UInteger = 0UI
+            For Each bt In bytes
+                Dim idx = (crc Xor bt) And &HFFUI
+                crc = (crc >> 8) Xor Crc32Table(CInt(idx))
+            Next
+            Return crc
+        End Function
+
         ''' <summary>Standard zip CRC32 (poly 0xEDB88320) over arbitrary bytes. Public for external
         ''' use (e.g. ArchivePackager diff: hash a VirtualEntry.Data once, compare against CRC32 of
         ''' an existing entry's decompressed payload).</summary>
@@ -399,8 +419,8 @@ Namespace BethesdaArchive.Core
                 '   el pass-through; no extender el modelo ahora (caso no alcanzable).
                 Dim fm As New FileMeta With {
                     .Index = iFile,
-                    .HashFile = Ba2WriterCommon.Crc32Ascii(stem),
-                    .HashDir = Ba2WriterCommon.Crc32Ascii(parent),
+                    .HashFile = Ba2WriterCommon.Fo4PathHash(stem),
+                    .HashDir = Ba2WriterCommon.Fo4PathHash(parent),
                     .HashExt = Ba2WriterCommon.PackExt(extNoDot),
                     .ModIndex = 0,
                     .ChunkCount = 1,
@@ -608,9 +628,9 @@ Namespace BethesdaArchive.Core
                     Dim ps = ve.PayloadSource
                     fm = New FileMeta With {
                         .Index = i,
-                        .HashFile = Ba2WriterCommon.Crc32Ascii(stem),
+                        .HashFile = Ba2WriterCommon.Fo4PathHash(stem),
                         .HashExt = Ba2WriterCommon.PackExt(extNoDot),
-                        .HashDir = Ba2WriterCommon.Crc32Ascii(parent),
+                        .HashDir = Ba2WriterCommon.Fo4PathHash(parent),
                         .ModIndex = 0,
                         .ChunkCount = 1,
                         .ChunkHeaderSize = CUShort(16),
@@ -625,9 +645,9 @@ Namespace BethesdaArchive.Core
                     Dim pc As Byte() = If(ve.PreCompressedBytes, Array.Empty(Of Byte)())
                     fm = New FileMeta With {
                         .Index = i,
-                        .HashFile = Ba2WriterCommon.Crc32Ascii(stem),
+                        .HashFile = Ba2WriterCommon.Fo4PathHash(stem),
                         .HashExt = Ba2WriterCommon.PackExt(extNoDot),
-                        .HashDir = Ba2WriterCommon.Crc32Ascii(parent),
+                        .HashDir = Ba2WriterCommon.Fo4PathHash(parent),
                         .ModIndex = 0,
                         .ChunkCount = 1,
                         .ChunkHeaderSize = CUShort(16),
@@ -655,9 +675,9 @@ Namespace BethesdaArchive.Core
 
                     fm = New FileMeta With {
                         .Index = i,
-                        .HashFile = Ba2WriterCommon.Crc32Ascii(stem),
+                        .HashFile = Ba2WriterCommon.Fo4PathHash(stem),
                         .HashExt = Ba2WriterCommon.PackExt(extNoDot),
-                        .HashDir = Ba2WriterCommon.Crc32Ascii(parent),
+                        .HashDir = Ba2WriterCommon.Fo4PathHash(parent),
                         .ModIndex = 0,
                         .ChunkCount = 1,
                         .ChunkHeaderSize = CUShort(16),              ' GNRL: 16 bytes; el sentinel se escribe aparte
