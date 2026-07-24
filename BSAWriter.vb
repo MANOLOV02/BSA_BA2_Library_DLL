@@ -116,6 +116,26 @@ Namespace BethesdaArchive.Core
             Public Property GlobalCompressed As Boolean = True
         End Class
 
+        ''' <summary>Bit de "file type" del header BSA (offset 32) para una extensión, replicando la tabla
+        ''' del motor (SkyrimSE @0x1420298F0). El motor SALTEA todo archive cuyo fileFlags no tenga el bit
+        ''' del tipo pedido (RE: lookup 0x140CF18F0 / registro 0x140CF09F0: <c>test [archive+0x1b0], bit ; je skip</c>).
+        ''' bit0 MESH · bit1 TEX · bit2 MENU · bit3 SND · bit4 VOICE · bit5 SHADER · bit6 TREE · bit7 FONT · 0x100 MISC (default).</summary>
+        Private Shared Function FileTypeBit(fileName As String) As UInteger
+            Dim ext = Path.GetExtension(If(fileName, "")).ToLowerInvariant()
+            ' Tabla EXACTA del motor (SkyrimSE_unpacked.exe @0x1420298F0, decodificada byte a byte):
+            Select Case ext
+                Case ".kf", ".nif", ".egm", ".egt", ".tri", ".cmp", ".lst", ".dtl", ".btr", ".bto" : Return &H1UI  ' MESH
+                Case ".dds", ".tai", ".tga", ".bmp" : Return &H2UI                                                   ' TEX
+                Case ".xml", ".txt" : Return &H4UI                                                                   ' MENU
+                Case ".wav" : Return &H8UI                                                                           ' SND
+                Case ".ogg", ".lip", ".xwm" : Return &H10UI                                                          ' VOICE
+                Case ".vso", ".pso", ".vsh" : Return &H20UI                                                          ' SHADER
+                Case ".spt" : Return &H40UI                                                                          ' TREE
+                Case ".fnt", ".tex" : Return &H80UI                                                                  ' FONT
+                Case Else : Return &H100UI                                                                           ' MISC (default del motor para ext desconocidas)
+            End Select
+        End Function
+
         '===================== PARTE 1: HEADER FIELDS + PAYLOAD BUILDER =====================
         Public Shared Sub Write(output As Stream, entriesIn As IEnumerable(Of VirtualEntry), opts As Options)
             If output Is Nothing OrElse Not output.CanWrite Then Throw New ArgumentException("Stream inválido.")
@@ -187,6 +207,14 @@ Namespace BethesdaArchive.Core
             Dim header_FileCount As UInteger = CUInt(fileCount)
             Dim header_FolderNameLength As UInteger = If(hasDirStrings, CUInt(folderNamesRawSum + folderCount), 0UI)
             Dim header_FileNameLength As UInteger = If(hasFileStrings, CUInt(fileNamesRawSum + fileCount), 0UI)
+
+            ' FileFlags (header offset 32) = OR de los bits de tipo de TODO el contenido. NO es "no usados":
+            ' el motor gatea la búsqueda de archives por fileFlags & bitDeTipo, así que con 0 no servía las
+            ' texturas/mesh del BSA (la facetint no aparecía). Es lo que computa Archive.exe/CK escaneando el contenido.
+            Dim header_FileFlags As UInteger = 0UI
+            For Each e In entries
+                header_FileFlags = header_FileFlags Or FileTypeBit(e.FileName)
+            Next
 
             ' ---- Build per-entry write records (sizeField + BSTRING bytes + payload source) ----
             ' Three payload paths:
@@ -335,7 +363,7 @@ Namespace BethesdaArchive.Core
             output.Write(BitConverter.GetBytes(header_FileCount), 0, 4)
             output.Write(BitConverter.GetBytes(header_FolderNameLength), 0, 4)
             output.Write(BitConverter.GetBytes(header_FileNameLength), 0, 4)
-            output.Write(BitConverter.GetBytes(0UI), 0, 4)                 ' FileFlags (no usados)
+            output.Write(BitConverter.GetBytes(header_FileFlags), 0, 4)    ' FileFlags = OR de bits de tipo del contenido (el motor gatea lookups por esto)
 
             ' ========= DIRECTORY ENTRIES =========
             output.Position = posDirEntries
