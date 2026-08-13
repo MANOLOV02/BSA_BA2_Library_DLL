@@ -174,9 +174,30 @@ Namespace BethesdaArchive.Core
         Friend Shared Function CompressZlib(data As Byte(), preset As ZlibPreset) As Byte()
             If data Is Nothing OrElse data.Length = 0 Then Return Array.Empty(Of Byte)()
 
-            ' 1) Comprimir RAW DEFLATE con DeflateStream
-            Dim deflate As Byte()
-            Using ms As New MemoryStream()
+            ' ⛔ UN SOLO BUFFER PARA TODO EL ZLIB.
+            ' Antes esto hacia CUATRO pasadas del tamaño completo para agregar 6 bytes de cabecera y cola:
+            '   (1) `ms` sin capacidad, creciendo por duplicacion  -> basura de LOH
+            '   (2) `ms.ToArray()`                                 -> copia entera
+            '   (3) `outMs` TAMBIEN sin capacidad, duplicando otra vez -> mas basura de LOH
+            '   (4) `outMs.ToArray()`                              -> otra copia entera
+            ' Ahora el deflate se escribe DIRECTO adentro del buffer final, despues de los 2 bytes de
+            ' cabecera, y la cola del Adler se agrega al final: un solo array, sin copias intermedias.
+            ' Los bytes de salida son los mismos — es el mismo stream zlib.
+            Dim cmfPre As Byte = &H78
+            Dim flgPre As Byte
+            Select Case preset
+                Case ZlibPreset.Fast : flgPre = &H1
+                Case ZlibPreset.Max : flgPre = &HDA
+                Case Else : flgPre = &H9C
+            End Select
+
+            ' Capacidad inicial: el comprimido casi nunca supera al original, y si lo supera el
+            ' MemoryStream crece solo. Arrancar en el tamaño del origen evita las duplicaciones del caso
+            ' normal sin castigar el patologico.
+            Using outMs As New MemoryStream(data.Length + 16)
+                outMs.WriteByte(cmfPre)
+                outMs.WriteByte(flgPre)
+
                 Dim level As IO.Compression.CompressionLevel
                 Select Case preset
                     Case ZlibPreset.Fast
@@ -187,31 +208,12 @@ Namespace BethesdaArchive.Core
                         level = Compression.CompressionLevel.Optimal
                 End Select
 
-                Using ds As New IO.Compression.DeflateStream(ms, level, True)
+                Using ds As New IO.Compression.DeflateStream(outMs, level, True)
                     ds.Write(data, 0, data.Length)
                 End Using
-                deflate = ms.ToArray()
-                End Using
 
-            ' 2) Cabecera ZLIB (CMF/FLG) según preset
-            ' CMF = 0x78 (CINFO=7 → 32KB, CM=8 → DEFLATE). FLG ya preajustado para %31==0.
-            Dim cmf As Byte = &H78
-            Dim flg As Byte
-            Select Case preset
-                Case ZlibPreset.Fast : flg = &H1      ' 0x78 0x01
-                Case ZlibPreset.Max : flg = &HDA     ' 0x78 0xDA
-                Case Else : flg = &H9C     ' 0x78 0x9C (Default)
-            End Select
-
-            ' 3) Adler-32 del ORIGINAL (no del comprimido), big-endian
-            Dim adler As UInteger = Adler32(data)
-
-            ' 4) Armar ZLIB: [CMF][FLG][DEFLATE...][Adler32 big-endian]
-            Using outMs As New MemoryStream()
-                outMs.WriteByte(cmf)
-                outMs.WriteByte(flg)
-                outMs.Write(deflate, 0, deflate.Length)
-                ' Adler-32 big-endian
+                ' Adler-32 del ORIGINAL (no del comprimido), big-endian, como cola del stream zlib.
+                Dim adler As UInteger = Adler32(data)
                 outMs.WriteByte(CByte((adler >> 24) And &HFFUI))
                 outMs.WriteByte(CByte((adler >> 16) And &HFFUI))
                 outMs.WriteByte(CByte((adler >> 8) And &HFFUI))
@@ -222,12 +224,25 @@ Namespace BethesdaArchive.Core
 
         Private Shared Function Adler32(data As Byte()) As UInteger
             Const MOD_ADLER As UInteger = 65521UI
+            ' ⛔ El `Mod` va por BLOQUE, no por byte. La version anterior hacia DOS divisiones por byte:
+            ' 44 millones de divisiones para una textura de 22 MB. 5552 es el maximo de iteraciones que
+            ' `b` aguanta sin desbordar 32 bits partiendo de a<65521 y bytes de 255 — es la constante
+            ' clasica de zlib (NMAX), no un numero elegido a ojo. El resultado es EL MISMO.
             Dim a As UInteger = 1UI
             Dim b As UInteger = 0UI
-            For i As Integer = 0 To data.Length - 1
-                a = (a + data(i)) Mod MOD_ADLER
-                b = (b + a) Mod MOD_ADLER
-            Next
+            Const NMAX As Integer = 5552
+            Dim i As Integer = 0
+            While i < data.Length
+                Dim n = Math.Min(NMAX, data.Length - i)
+                Dim fin = i + n - 1
+                While i <= fin
+                    a += data(i)
+                    b += a
+                    i += 1
+                End While
+                a = a Mod MOD_ADLER
+                b = b Mod MOD_ADLER
+            End While
             Return (b << 16) Or a
         End Function
         ' ====== Helper para escribir el "compression_format" v3 ======
@@ -396,7 +411,12 @@ Namespace BethesdaArchive.Core
                 If ve.MipCount <= 0 Then Throw New InvalidDataException("DX10: MipCount inválido.")
                 If ve.Faces <= 0 Then Throw New InvalidDataException("DX10: Faces inválido.")
                 If ve.DxgiFormat < 0 OrElse ve.DxgiFormat > 255 Then Throw New InvalidDataException("DX10: DxgiFormat inválido (0..255).")
-                Dim faces As Integer = If(ve.IsCubemap, 6, ve.Faces)
+                ' ⛔ ACÁ NO SE DERIVA NINGÚN "faces". Había un `Dim faces = If(ve.IsCubemap, 6, ve.Faces)`
+                ' que NO SE USABA — un local muerto, y muerto desde antes. Se sacó en vez de mantenerlo.
+                ' El motivo por el que no puede usarse: la entrada DX10 del BA2 NO TIENE campo de tamaño de
+                ' array. Lo único que lleva es `Dx10_Flags`, donde 1 = cubemap (ver abajo) más MipCount,
+                ' formato y TileMode. Un Texture2DArray de N elementos NO es representable en este formato,
+                ' así que no hay ningún header "mintiendo" que corregir: es un límite del contenedor.
 
                 ' Hashes
                 Dim relNorm As String = PathUtil.JoinDirFile(ve.Directory, ve.FileName)
@@ -531,6 +551,18 @@ Namespace BethesdaArchive.Core
                     If cd IsNot Nothing AndAlso cd.Length > 0 Then
                         output.Write(cd, 0, cd.Length)
                     End If
+                ' ⛔ SOLTAR EL PAYLOAD APENAS SE ESCRIBIO. El writer comprime TODO en una primera pasada
+                ' (acumulando en `perFile`/`metas`) y recien escribe en la segunda, asi que sin esto los
+                ' bytes comprimidos de las N entradas viven a la vez hasta terminar el archivo. Empaquetando
+                ' un bake de 2000 diffuse 4096² eso es un pico de decenas de GB — OOM garantizada en 8 GB.
+                ' Soltarlo aca corta el pico a lo que ya se escribio; el arreglo de fondo es comprimir a
+                ' temporales y usar PayloadSrc, que es el camino de stream-copy que esta justo arriba.
+                ' ⚠️ EL ALIVIO ES PARCIAL, no total: esto suelta la referencia del `FileMeta`, y eso libera
+                ' de verdad SOLO cuando el array lo produjo el compresor. En el camino `store` y cuando la
+                ' entrada trae `PreCompressedBytes`, el array sigue siendo el del `VirtualEntry` del
+                ' llamador y anular este campo no baja un byte — ahi el dueño de la memoria es quien armo
+                ' la lista de entradas, no el writer.
+                    fm.Chunk_CompData = Nothing
                 End If
             Next
 
@@ -736,6 +768,18 @@ Namespace BethesdaArchive.Core
                 ElseIf fm.CompData IsNot Nothing AndAlso fm.CompData.Length > 0 Then
                     output.Write(fm.CompData, 0, fm.CompData.Length)
                 End If
+                ' ⛔ SOLTAR EL PAYLOAD APENAS SE ESCRIBIO. El writer comprime TODO en una primera pasada
+                ' (acumulando en `perFile`/`metas`) y recien escribe en la segunda, asi que sin esto los
+                ' bytes comprimidos de las N entradas viven a la vez hasta terminar el archivo. Empaquetando
+                ' un bake de 2000 diffuse 4096² eso es un pico de decenas de GB — OOM garantizada en 8 GB.
+                ' Soltarlo aca corta el pico a lo que ya se escribio; el arreglo de fondo es comprimir a
+                ' temporales y usar PayloadSrc, que es el camino de stream-copy que esta justo arriba.
+                ' ⚠️ EL ALIVIO ES PARCIAL, no total: esto suelta la referencia del `FileMeta`, y eso libera
+                ' de verdad SOLO cuando el array lo produjo el compresor. En el camino `store` y cuando la
+                ' entrada trae `PreCompressedBytes`, el array sigue siendo el del `VirtualEntry` del
+                ' llamador y anular este campo no baja un byte — ahi el dueño de la memoria es quien armo
+                ' la lista de entradas, no el writer.
+                fm.CompData = Nothing
             Next
 
             ' ===== Name table (UTF-8, u16 length) opcional =====

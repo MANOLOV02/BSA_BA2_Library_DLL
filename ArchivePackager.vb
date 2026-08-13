@@ -14,6 +14,16 @@ Namespace BethesdaArchive.Core
     End Enum
 
     Public NotInheritable Class PackagerRequest
+        ''' <summary>⭐ EL TOPE DE ARCHIVO, ESCRITO UNA VEZ. 3 GiB, el límite del formato.
+        ''' <para>⛔ Estaba en TRES constantes privadas, en dos ortografías que ningún grep une:
+        ''' <c>MAX_ARCHIVE_BYTES = 3L &lt;&lt; 30</c> en <c>NpcFaceGenPacker</c> y
+        ''' <c>MAX_BYTES_FO4</c>/<c>MAX_BYTES_SSE = 3L * 1024L * 1024L * 1024L</c> en
+        ''' <c>WM_PackUnpack</c> — más este default. Cuatro sitios para un número del formato, que no es
+        ''' una preferencia de cada app. Buscar uno no encontraba los otros.</para></summary>
+        ''' <para>⚠️ `Shared ReadOnly` y NO `Const`: un `Const` lo INLINEA el compilador en cada EXE, asi que
+''' una DLL nueva con otro tope no llegaria a un ejecutable que no se recompile. Asi viaja de verdad.</para>
+        Public Shared ReadOnly MaxArchiveBytesDefault As Long = 3L << 30
+
         Public Property Game As GameKind
 
         ' BA2 header version written for FO4 archives (GNRL + DX10). FO4-only: IGNORED when
@@ -28,10 +38,11 @@ Namespace BethesdaArchive.Core
         Public Property ModBaseName As String = "WM_ClonePack"
         Public Property OutputDir As String = ""
         Public Property Entries As List(Of VirtualEntry)
-        ' Soft cap per archive. Recommended: FO4 = 3GB, SSE = 2GB (BSA u32 offsets, 4GB hard limit).
+        ' Soft cap per archive. ⛔ El doc decia "FO4 = 3GB, SSE = 2GB" y era FALSO: los tres sitios que lo
+        ' fijaban usaban 3 GiB para los DOS juegos. El limite duro del BSA sigue siendo 4GB (offsets u32).
         ' When a bundle exceeds this, Pack distributes entries across numbered companion plugins
         ' ("WM_ClonePack2.esp", "WM_ClonePack3.esp", ...) so the engine auto-loads each pair.
-        Public Property MaxArchiveBytes As Long = 3L << 30
+        Public Property MaxArchiveBytes As Long = MaxArchiveBytesDefault
 
         ' Estimate of compressed/raw size ratio used when planning slot assignment for new entries.
         ' Lower = more conservative (more splits). 0.85 means "assume payload shrinks to 85% after

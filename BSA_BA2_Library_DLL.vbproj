@@ -26,6 +26,14 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Tools/TexCodecPerfProbe: gate del zlib del writer de BA2. `CompressZlib` es `Friend` y asi se
+         queda: el arnes entra por InternalsVisibleTo y la superficie distribuida no cambia.
+         Ver 00-reglas-self-tests-no-van-en-el-binario. -->
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>TexCodecPerfProbe</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\..\DirectXTextWrapper\DirectXTexWrapper.vcxproj" />
   </ItemGroup>
 

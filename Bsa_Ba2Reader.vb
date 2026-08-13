@@ -9,6 +9,13 @@ Imports K4os.Compression.LZ4.Streams
 
 ' ======== API pública ========
 Namespace BethesdaArchive.Core
+
+    ''' <summary>Techo del pre-alloc del MemoryStream de extraccion. Cota del FORMATO, no de la maquina:
+    ''' ninguna textura de FO4/SSE se acerca (4096x4096 BC7 con mips ~22 MB). Por encima de esto el
+    ''' `DecompressedSize` del header no es creible y se deja crecer el stream solo.</summary>
+    Friend Module Ba2ReaderLimits
+        Friend Const MaxPreAllocBytes As Long = 256L * 1024L * 1024L
+    End Module
     Public Class BethesdaReader
         Implements IDisposable
 
@@ -719,7 +726,33 @@ Namespace BethesdaArchive.Core
                 ' Orden físico por Offset por robustez (no debería alterar si ya viene ordenado)
                 Dim ordered = Chunks.OrderBy(Function(c) c.Offset).ToList()
 
-                Using ms As New MemoryStream()
+                    ' ⛔ CAPACIDAD EXACTA, que YA se conoce. Sin ella el MemoryStream arranca en 0 y crece
+                    ' DUPLICANDO: para una textura de 22 MB son ~8 realocaciones, y cada buffer intermedio
+                    ' de mas de 85 KB queda tirado en el LOH. Con miles de extracciones por bake eso es
+                    ' cientos de GB de trafico de LOH para entregar los mismos bytes. `DecompressedSize`
+                    ' de cada chunk viene del header y ya esta leido.
+                Dim capacidad As Long = 0
+                For Each c In ordered
+                    capacidad += CLng(c.DecompressedSize)
+                Next
+                ' ⛔ SE ACOTA AL TAMAÑO REAL DEL ARCHIVO. `DecompressedSize` es un campo del HEADER y no
+                ' lo valida nadie: un BA2 corrupto o de terceros que declare ~2e9 provocaba una reserva de
+                ' ~2 GB ANTES de leer un solo byte ⇒ OutOfMemory en un equipo de 8 GB, cuando antes el
+                ' MemoryStream crecia con los bytes reales y el fallo salia como dato invalido. La app se
+                ' distribuye y abre archives ajenos. El pre-alloc es una OPTIMIZACION: si el numero no es
+                ' creible se cae a 0 y el stream crece solo.
+                ' ⛔ LA COTA ES ABSOLUTA, NO `fs.Length`. Comparar el tamaño DESCOMPRIMIDO de una entrada
+                ' contra el del archive COMPRIMIDO apagaba el pre-alloc justo en los archives que mejor
+                ' comprimen —un BA2 de facetints planos comprime 15-20:1, o sea entrada de 22 MB dentro de
+                ' un archivo de 3 MB— que son exactamente el caso que la optimizacion perseguia. Peor: en
+                ' DX10 `capacidad` arranca en `ddsHeader.Length`, que es memoria y no archivo, asi que la
+                ' comparacion mezclaba dos universos. El techo de 256 MB no esta calibrado a esta maquina:
+                ' es una cota del FORMATO — ninguna textura de estos juegos se acerca (un 4096x4096 BC7 con
+                ' mips son ~22 MB) — y sigue impidiendo la reserva de ~2 GB de un header corrupto.
+                If capacidad > Ba2ReaderLimits.MaxPreAllocBytes Then capacidad = 0
+                If capacidad <= 0 OrElse capacidad > Integer.MaxValue Then capacidad = 0
+
+                Using ms As New MemoryStream(CInt(capacidad))
                     For Each ch In ordered
 
                         If CLng(ch.Offset) < 0 OrElse CLng(ch.Offset) >= fs.Length Then
@@ -855,7 +888,33 @@ Namespace BethesdaArchive.Core
                 ' Los chunks DX10 pueden no venir en orden lógico de mips; ordenamos por MipFirst asc
                 Dim ordered = Chunks.OrderBy(Function(c) CInt(c.MipFirst)).ThenBy(Function(c) CLng(c.Offset)).ToList()
 
-                Using ms As New MemoryStream()
+                    ' ⛔ CAPACIDAD EXACTA, que YA se conoce. Sin ella el MemoryStream arranca en 0 y crece
+                    ' DUPLICANDO: para una textura de 22 MB son ~8 realocaciones, y cada buffer intermedio
+                    ' de mas de 85 KB queda tirado en el LOH. Con miles de extracciones por bake eso es
+                    ' cientos de GB de trafico de LOH para entregar los mismos bytes. `DecompressedSize`
+                    ' de cada chunk viene del header y ya esta leido.
+                Dim capacidad As Long = ddsHeader.Length
+                For Each c In ordered
+                    capacidad += CLng(c.DecompressedSize)
+                Next
+                ' ⛔ SE ACOTA AL TAMAÑO REAL DEL ARCHIVO. `DecompressedSize` es un campo del HEADER y no
+                ' lo valida nadie: un BA2 corrupto o de terceros que declare ~2e9 provocaba una reserva de
+                ' ~2 GB ANTES de leer un solo byte ⇒ OutOfMemory en un equipo de 8 GB, cuando antes el
+                ' MemoryStream crecia con los bytes reales y el fallo salia como dato invalido. La app se
+                ' distribuye y abre archives ajenos. El pre-alloc es una OPTIMIZACION: si el numero no es
+                ' creible se cae a 0 y el stream crece solo.
+                ' ⛔ LA COTA ES ABSOLUTA, NO `fs.Length`. Comparar el tamaño DESCOMPRIMIDO de una entrada
+                ' contra el del archive COMPRIMIDO apagaba el pre-alloc justo en los archives que mejor
+                ' comprimen —un BA2 de facetints planos comprime 15-20:1, o sea entrada de 22 MB dentro de
+                ' un archivo de 3 MB— que son exactamente el caso que la optimizacion perseguia. Peor: en
+                ' DX10 `capacidad` arranca en `ddsHeader.Length`, que es memoria y no archivo, asi que la
+                ' comparacion mezclaba dos universos. El techo de 256 MB no esta calibrado a esta maquina:
+                ' es una cota del FORMATO — ninguna textura de estos juegos se acerca (un 4096x4096 BC7 con
+                ' mips son ~22 MB) — y sigue impidiendo la reserva de ~2 GB de un header corrupto.
+                If capacidad > Ba2ReaderLimits.MaxPreAllocBytes Then capacidad = 0
+                If capacidad <= 0 OrElse capacidad > Integer.MaxValue Then capacidad = 0
+
+                Using ms As New MemoryStream(CInt(capacidad))
                     ms.Write(ddsHeader, 0, ddsHeader.Length)
 
                     For Each ch In ordered

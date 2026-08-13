@@ -111,11 +111,16 @@ Namespace BethesdaArchive.Core
         Public Property Faces As Integer
     End Class
 
-    Public NotInheritable Class ArchiveChangeSet
-        Public ReadOnly Adds As New Dictionary(Of String, VirtualEntry)(StringComparer.OrdinalIgnoreCase)
-        Public ReadOnly Deletes As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
-        Public ReadOnly Renames As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
-        Public ReadOnly Replacements As New Dictionary(Of String, VirtualEntry)(StringComparer.OrdinalIgnoreCase)
+    ' ⛔ DEMOTADO A Friend: `ArchiveChangeSet`/`ArchiveHandle`/`MultiArchiveEditor`/`OpenMany` no tienen
+    ' NI UNA referencia fuera de este archivo — sólo las tres declaraciones y sus usos mutuos. Es una API
+    ' de edición multi-archivo que nunca ejecutó una instrucción, congelada como superficie pública en la
+    ' más chica de las dos DLL que se distribuyen. Se conserva el código (puede ser la base de la edición
+    ' por lotes) pero deja de ser un compromiso binario.
+    Friend NotInheritable Class ArchiveChangeSet
+        Friend ReadOnly Adds As New Dictionary(Of String, VirtualEntry)(StringComparer.OrdinalIgnoreCase)
+        Friend ReadOnly Deletes As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+        Friend ReadOnly Renames As New Dictionary(Of String, String)(StringComparer.OrdinalIgnoreCase)
+        Friend ReadOnly Replacements As New Dictionary(Of String, VirtualEntry)(StringComparer.OrdinalIgnoreCase)
     End Class
 
     Public Enum GameKind
@@ -140,14 +145,14 @@ Namespace BethesdaArchive.Core
         Lz4Frame
     End Enum
 
-    Public NotInheritable Class ArchiveHandle
-        Public ReadOnly Property Kind As GameKind
-        Public ReadOnly Property SourcePath As String
-        Public ReadOnly Property Encoding As Encoding
-        Public ReadOnly ChangeSet As New ArchiveChangeSet()
-        Public ReadOnly Entries As List(Of VirtualEntry)
+    Friend NotInheritable Class ArchiveHandle
+        Friend ReadOnly Property Kind As GameKind
+        Friend ReadOnly Property SourcePath As String
+        Friend ReadOnly Property Encoding As Encoding
+        Friend ReadOnly ChangeSet As New ArchiveChangeSet()
+        Friend ReadOnly Entries As List(Of VirtualEntry)
 
-        Public Sub New(kind As GameKind, sourcePath As String, encoding As Encoding, entries As List(Of VirtualEntry))
+        Friend Sub New(kind As GameKind, sourcePath As String, encoding As Encoding, entries As List(Of VirtualEntry))
             Me.Kind = kind
             Me.SourcePath = sourcePath
             Me.Encoding = If(encoding, Encoding.UTF8)
@@ -155,15 +160,15 @@ Namespace BethesdaArchive.Core
         End Sub
     End Class
 
-    Public NotInheritable Class MultiArchiveEditor
+    Friend NotInheritable Class MultiArchiveEditor
         Private ReadOnly _handles As New List(Of ArchiveHandle)
-        Public ReadOnly Property [Handles] As IReadOnlyList(Of ArchiveHandle)
+        Friend ReadOnly Property [Handles] As IReadOnlyList(Of ArchiveHandle)
             Get
                 Return _handles
             End Get
         End Property
 
-        Public Sub OpenMany(kind As GameKind, archives As IEnumerable(Of (path As String, entries As List(Of VirtualEntry), enc As Encoding)))
+        Friend Sub OpenMany(kind As GameKind, archives As IEnumerable(Of (path As String, entries As List(Of VirtualEntry), enc As Encoding)))
             For Each a In archives
                 _handles.Add(New ArchiveHandle(kind, a.path, a.enc, a.entries))
             Next
