@@ -15,6 +15,16 @@ Namespace BethesdaArchive.Core
     ''' `DecompressedSize` del header no es creible y se deja crecer el stream solo.</summary>
     Friend Module Ba2ReaderLimits
         Friend Const MaxPreAllocBytes As Long = 256L * 1024L * 1024L
+        ''' <summary>Cota SUPERIOR DEMOSTRABLE de expansión de un bloque comprimido, en veces.
+        ''' <para>⛔ NO es "un margen holgado": es el máximo del FORMATO. Un bloque deflate puede
+        ''' expandirse a lo sumo 1032:1 (una secuencia de 258 bytes de match codificada en ~2 bits ⇒
+        ''' 258/0,25). LZ4 tiene un tope menor (~255:1), así que 1032 los cubre a los dos.</para>
+        ''' <para>⛔ ESTO CORRIGE UNA AFIRMACIÓN FALSA que estuvo escrita acá: que 32:1 "está por encima
+        ''' de cualquier ratio real de zlib sobre texturas". NO lo está. Un chunk de DDS uniforme —un
+        ''' facetint plano, un _s negro, un mip 1x1— comprime muchísimo más que 32:1, y con el techo viejo
+        ''' `fs.Length * 32` esos casos apagaban el pre-alloc, que es exactamente lo que la optimización
+        ''' venía a resolver. El número correcto no se elige: lo fija el formato.</para></summary>
+        Friend Const MaxBlockExpansion As Long = 1032L
     End Module
     Public Class BethesdaReader
         Implements IDisposable
@@ -732,23 +742,35 @@ Namespace BethesdaArchive.Core
                     ' cientos de GB de trafico de LOH para entregar los mismos bytes. `DecompressedSize`
                     ' de cada chunk viene del header y ya esta leido.
                 Dim capacidad As Long = 0
+                ' ⛔ SE ACOTA POR CHUNK CONTRA SU PROPIO `CompressedSize`. `DecompressedSize` es un campo
+                ' del HEADER y no lo valida nadie: un BA2 corrupto o de terceros que declare ~2e9 provocaba
+                ' una reserva de ~2 GB ANTES de leer un solo byte ⇒ OutOfMemory en un equipo de 8 GB. Y no
+                ' es un caso de a uno: `FilesDictionary` extrae con `Parallel.ForEach` SIN
+                ' MaxDegreeOfParallelism, o sea 12 hilos reservando a la vez. La app se distribuye y abre
+                ' archives ajenos. El pre-alloc es una OPTIMIZACION: si el numero no es creible se cae a 0 y
+                ' el stream crece solo, que es el comportamiento de siempre.
+                ' ⛔ LA COTA ES POR CHUNK, NO GLOBAL CONTRA `fs.Length`. Las dos formas anteriores estaban
+                ' mal, y las dos las escribi yo:
+                '   · `capacidad > fs.Length` compara el tamaño DESCOMPRIMIDO contra el archive COMPRIMIDO,
+                '     asi que apagaba el pre-alloc justo en los archives que mejor comprimen — que son el
+                '     caso que la optimizacion perseguia.
+                '   · `fs.Length * 32` heredaba el mismo defecto con otro nombre: un BA2 chico de contenido
+                '     muy uniforme supera 32:1 sin ninguna corrupcion (ver `MaxBlockExpansion`).
+                ' El unico numero que acota de verdad es `CompressedSize` del chunk: son bytes que EXISTEN
+                ' en el archivo, y un bloque comprimido no puede expandirse mas de `MaxBlockExpansion`
+                ' veces. Un chunk sin comprimir se acota contra `fs.Length` porque sus bytes estan crudos en
+                ' el archivo. Encima queda el techo del FORMATO (`MaxPreAllocBytes`, 256 MB: ninguna textura
+                ' de estos juegos se acerca — un 4096x4096 BC7 con mips son ~22 MB).
                 For Each c In ordered
-                    capacidad += CLng(c.DecompressedSize)
+                    Dim declarado As Long = CLng(c.DecompressedSize)
+                    Dim creible As Long
+                    If c.CompressedSize <> 0UI Then
+                        creible = CLng(c.CompressedSize) * Ba2ReaderLimits.MaxBlockExpansion
+                    Else
+                        creible = fs.Length
+                    End If
+                    capacidad += Math.Min(declarado, creible)
                 Next
-                ' ⛔ SE ACOTA AL TAMAÑO REAL DEL ARCHIVO. `DecompressedSize` es un campo del HEADER y no
-                ' lo valida nadie: un BA2 corrupto o de terceros que declare ~2e9 provocaba una reserva de
-                ' ~2 GB ANTES de leer un solo byte ⇒ OutOfMemory en un equipo de 8 GB, cuando antes el
-                ' MemoryStream crecia con los bytes reales y el fallo salia como dato invalido. La app se
-                ' distribuye y abre archives ajenos. El pre-alloc es una OPTIMIZACION: si el numero no es
-                ' creible se cae a 0 y el stream crece solo.
-                ' ⛔ LA COTA ES ABSOLUTA, NO `fs.Length`. Comparar el tamaño DESCOMPRIMIDO de una entrada
-                ' contra el del archive COMPRIMIDO apagaba el pre-alloc justo en los archives que mejor
-                ' comprimen —un BA2 de facetints planos comprime 15-20:1, o sea entrada de 22 MB dentro de
-                ' un archivo de 3 MB— que son exactamente el caso que la optimizacion perseguia. Peor: en
-                ' DX10 `capacidad` arranca en `ddsHeader.Length`, que es memoria y no archivo, asi que la
-                ' comparacion mezclaba dos universos. El techo de 256 MB no esta calibrado a esta maquina:
-                ' es una cota del FORMATO — ninguna textura de estos juegos se acerca (un 4096x4096 BC7 con
-                ' mips son ~22 MB) — y sigue impidiendo la reserva de ~2 GB de un header corrupto.
                 If capacidad > Ba2ReaderLimits.MaxPreAllocBytes Then capacidad = 0
                 If capacidad <= 0 OrElse capacidad > Integer.MaxValue Then capacidad = 0
 
@@ -894,23 +916,35 @@ Namespace BethesdaArchive.Core
                     ' cientos de GB de trafico de LOH para entregar los mismos bytes. `DecompressedSize`
                     ' de cada chunk viene del header y ya esta leido.
                 Dim capacidad As Long = ddsHeader.Length
+                ' ⛔ SE ACOTA POR CHUNK CONTRA SU PROPIO `CompressedSize`. `DecompressedSize` es un campo
+                ' del HEADER y no lo valida nadie: un BA2 corrupto o de terceros que declare ~2e9 provocaba
+                ' una reserva de ~2 GB ANTES de leer un solo byte ⇒ OutOfMemory en un equipo de 8 GB. Y no
+                ' es un caso de a uno: `FilesDictionary` extrae con `Parallel.ForEach` SIN
+                ' MaxDegreeOfParallelism, o sea 12 hilos reservando a la vez. La app se distribuye y abre
+                ' archives ajenos. El pre-alloc es una OPTIMIZACION: si el numero no es creible se cae a 0 y
+                ' el stream crece solo, que es el comportamiento de siempre.
+                ' ⛔ LA COTA ES POR CHUNK, NO GLOBAL CONTRA `fs.Length`. Las dos formas anteriores estaban
+                ' mal, y las dos las escribi yo:
+                '   · `capacidad > fs.Length` compara el tamaño DESCOMPRIMIDO contra el archive COMPRIMIDO,
+                '     asi que apagaba el pre-alloc justo en los archives que mejor comprimen — que son el
+                '     caso que la optimizacion perseguia.
+                '   · `fs.Length * 32` heredaba el mismo defecto con otro nombre: un BA2 chico de contenido
+                '     muy uniforme supera 32:1 sin ninguna corrupcion (ver `MaxBlockExpansion`).
+                ' El unico numero que acota de verdad es `CompressedSize` del chunk: son bytes que EXISTEN
+                ' en el archivo, y un bloque comprimido no puede expandirse mas de `MaxBlockExpansion`
+                ' veces. Un chunk sin comprimir se acota contra `fs.Length` porque sus bytes estan crudos en
+                ' el archivo. Encima queda el techo del FORMATO (`MaxPreAllocBytes`, 256 MB: ninguna textura
+                ' de estos juegos se acerca — un 4096x4096 BC7 con mips son ~22 MB).
                 For Each c In ordered
-                    capacidad += CLng(c.DecompressedSize)
+                    Dim declarado As Long = CLng(c.DecompressedSize)
+                    Dim creible As Long
+                    If c.CompressedSize <> 0UI Then
+                        creible = CLng(c.CompressedSize) * Ba2ReaderLimits.MaxBlockExpansion
+                    Else
+                        creible = fs.Length
+                    End If
+                    capacidad += Math.Min(declarado, creible)
                 Next
-                ' ⛔ SE ACOTA AL TAMAÑO REAL DEL ARCHIVO. `DecompressedSize` es un campo del HEADER y no
-                ' lo valida nadie: un BA2 corrupto o de terceros que declare ~2e9 provocaba una reserva de
-                ' ~2 GB ANTES de leer un solo byte ⇒ OutOfMemory en un equipo de 8 GB, cuando antes el
-                ' MemoryStream crecia con los bytes reales y el fallo salia como dato invalido. La app se
-                ' distribuye y abre archives ajenos. El pre-alloc es una OPTIMIZACION: si el numero no es
-                ' creible se cae a 0 y el stream crece solo.
-                ' ⛔ LA COTA ES ABSOLUTA, NO `fs.Length`. Comparar el tamaño DESCOMPRIMIDO de una entrada
-                ' contra el del archive COMPRIMIDO apagaba el pre-alloc justo en los archives que mejor
-                ' comprimen —un BA2 de facetints planos comprime 15-20:1, o sea entrada de 22 MB dentro de
-                ' un archivo de 3 MB— que son exactamente el caso que la optimizacion perseguia. Peor: en
-                ' DX10 `capacidad` arranca en `ddsHeader.Length`, que es memoria y no archivo, asi que la
-                ' comparacion mezclaba dos universos. El techo de 256 MB no esta calibrado a esta maquina:
-                ' es una cota del FORMATO — ninguna textura de estos juegos se acerca (un 4096x4096 BC7 con
-                ' mips son ~22 MB) — y sigue impidiendo la reserva de ~2 GB de un header corrupto.
                 If capacidad > Ba2ReaderLimits.MaxPreAllocBytes Then capacidad = 0
                 If capacidad <= 0 OrElse capacidad > Integer.MaxValue Then capacidad = 0
 
