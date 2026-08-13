@@ -743,12 +743,18 @@ Namespace BethesdaArchive.Core
                     ' de cada chunk viene del header y ya esta leido.
                 Dim capacidad As Long = 0
                 ' ⛔ SE ACOTA POR CHUNK CONTRA SU PROPIO `CompressedSize`. `DecompressedSize` es un campo
-                ' del HEADER y no lo valida nadie: un BA2 corrupto o de terceros que declare ~2e9 provocaba
-                ' una reserva de ~2 GB ANTES de leer un solo byte ⇒ OutOfMemory en un equipo de 8 GB. Y no
-                ' es un caso de a uno: `FilesDictionary` extrae con `Parallel.ForEach` SIN
-                ' MaxDegreeOfParallelism, o sea 12 hilos reservando a la vez. La app se distribuye y abre
-                ' archives ajenos. El pre-alloc es una OPTIMIZACION: si el numero no es creible se cae a 0 y
-                ' el stream crece solo, que es el comportamiento de siempre.
+                ' del HEADER y no lo valida nadie, y la app se distribuye y abre archives ajenos.
+                ' ⛔ EL CASO HOSTIL ES POR DEBAJO DE LOS 256 MB, no por encima. Un .ba2 de 1 KB que declare
+                ' 250 MB pasaba el techo del formato sin despeinarse, y `FilesDictionary` extrae con
+                ' `Parallel.ForEach` SIN MaxDegreeOfParallelism: 12 hilos × 250 MB = 3 GB reservados ANTES
+                ' de leer un byte, OOM en un equipo de 8 GB. (Un header que declara ~2e9 NO era el problema:
+                ' `MaxPreAllocBytes` ya lo llevaba a 0. Eso estuvo escrito aca y era falso.)
+                ' El pre-alloc es una OPTIMIZACION: si el numero no es creible se cae a 0 y el stream crece
+                ' solo, que es el comportamiento de siempre.
+                ' ⚠️ HUECO CONOCIDO Y NO CERRADO ACA: `ZlibStrict`/`Lz4Strict`, unas lineas mas abajo,
+                ' reservan `CInt(ch.DecompressedSize)` por chunk y por hilo con el MISMO campo sin acotar.
+                ' Este pre-alloc NO protege de eso. Acotarlos alli cambiaria comportamiento observable
+                ' (pasarian a RECHAZAR chunks que hoy descomprimen), asi que es una decision del usuario.
                 ' ⛔ LA COTA ES POR CHUNK, NO GLOBAL CONTRA `fs.Length`. Las dos formas anteriores estaban
                 ' mal, y las dos las escribi yo:
                 '   · `capacidad > fs.Length` compara el tamaño DESCOMPRIMIDO contra el archive COMPRIMIDO,
@@ -917,12 +923,18 @@ Namespace BethesdaArchive.Core
                     ' de cada chunk viene del header y ya esta leido.
                 Dim capacidad As Long = ddsHeader.Length
                 ' ⛔ SE ACOTA POR CHUNK CONTRA SU PROPIO `CompressedSize`. `DecompressedSize` es un campo
-                ' del HEADER y no lo valida nadie: un BA2 corrupto o de terceros que declare ~2e9 provocaba
-                ' una reserva de ~2 GB ANTES de leer un solo byte ⇒ OutOfMemory en un equipo de 8 GB. Y no
-                ' es un caso de a uno: `FilesDictionary` extrae con `Parallel.ForEach` SIN
-                ' MaxDegreeOfParallelism, o sea 12 hilos reservando a la vez. La app se distribuye y abre
-                ' archives ajenos. El pre-alloc es una OPTIMIZACION: si el numero no es creible se cae a 0 y
-                ' el stream crece solo, que es el comportamiento de siempre.
+                ' del HEADER y no lo valida nadie, y la app se distribuye y abre archives ajenos.
+                ' ⛔ EL CASO HOSTIL ES POR DEBAJO DE LOS 256 MB, no por encima. Un .ba2 de 1 KB que declare
+                ' 250 MB pasaba el techo del formato sin despeinarse, y `FilesDictionary` extrae con
+                ' `Parallel.ForEach` SIN MaxDegreeOfParallelism: 12 hilos × 250 MB = 3 GB reservados ANTES
+                ' de leer un byte, OOM en un equipo de 8 GB. (Un header que declara ~2e9 NO era el problema:
+                ' `MaxPreAllocBytes` ya lo llevaba a 0. Eso estuvo escrito aca y era falso.)
+                ' El pre-alloc es una OPTIMIZACION: si el numero no es creible se cae a 0 y el stream crece
+                ' solo, que es el comportamiento de siempre.
+                ' ⚠️ HUECO CONOCIDO Y NO CERRADO ACA: `ZlibStrict`/`Lz4Strict`, unas lineas mas abajo,
+                ' reservan `CInt(ch.DecompressedSize)` por chunk y por hilo con el MISMO campo sin acotar.
+                ' Este pre-alloc NO protege de eso. Acotarlos alli cambiaria comportamiento observable
+                ' (pasarian a RECHAZAR chunks que hoy descomprimen), asi que es una decision del usuario.
                 ' ⛔ LA COTA ES POR CHUNK, NO GLOBAL CONTRA `fs.Length`. Las dos formas anteriores estaban
                 ' mal, y las dos las escribi yo:
                 '   · `capacidad > fs.Length` compara el tamaño DESCOMPRIMIDO contra el archive COMPRIMIDO,
