@@ -51,4 +51,7 @@
       <LastGenOutput>Application.Designer.vb</LastGenOutput>
     </None>
   </ItemGroup>
- </Project>
+   <!-- Fija la plataforma del wrapper NATIVO. Va en LOS SEIS proyectos, no solo en los dos que lo
+       referencian de verdad: el SDK inyecta el ProjectReference transitivo sin la metadata. Ver el .targets. -->
+  <Import Project="..\..\DirectXTextWrapper\DirectXTexWrapper.targets" />
+</Project>

@@ -616,8 +616,15 @@ Namespace BethesdaArchive.Core
 
             ' Rewrite. Rename current → .bak so we can pass-through unchanged payloads from it,
             ' and so we have a recovery point if the new write fails.
+            ' ⛔ EL BORRADO DEL .bak VIEJO VA CON REINTENTO. Los lectores de archive abren con
+            ' `FileShare.Delete` (ver FilesDictionary_class.AbrirArchiveParaLectura), que es lo que permite
+            ' que el `File.Move` de abajo funcione con un lector en vuelo. El precio es que, si un handle
+            ' sobrevivio al `File.Delete(bakPath)` del flush ANTERIOR, ese nombre queda en *delete pending*
+            ' hasta que cierre, y un `File.Delete`/`File.Move` sobre el mismo nombre tira ERROR_DELETE_PENDING
+            ' (que .NET reporta como UnauthorizedAccessException, no como IOException). Es el UNICO punto
+            ' expuesto a eso, y dura lo que tarde el ExtractToMemory en curso.
             Dim bakPath = archivePath & ".bak"
-            If File.Exists(bakPath) Then File.Delete(bakPath)
+            BorrarConReintento(bakPath)
             File.Move(archivePath, bakPath)
 
             Try
@@ -671,6 +678,25 @@ Namespace BethesdaArchive.Core
         ' size + CRC32. CRC32 of existing entries forces a decompression pass — only paid once
         ' per Pack and only for paths that also appear in the bundle.
         ' --------------------------------------------------------------------------------------
+        ''' <summary>Borra un archivo tolerando *delete pending*: si un handle abierto con
+        ''' <c>FileShare.Delete</c> todavia no cerro, el nombre sigue existiendo hasta que lo haga y un
+        ''' borrado nuevo sobre ese nombre falla con ERROR_DELETE_PENDING (que .NET traduce a
+        ''' <see cref="UnauthorizedAccessException"/>, NO a <see cref="IOException"/> — atrapar sólo IO no
+        ''' alcanzaba). Cinco intentos de 100 ms: la ventana dura lo que tarde el <c>ExtractToMemory</c> en
+        ''' curso. Si igual no se puede, se deja tirar para que el llamador lo vea.</summary>
+        Private Shared Sub BorrarConReintento(path As String)
+            For intento = 1 To 5
+                Try
+                    If Not File.Exists(path) Then Return
+                    File.Delete(path)
+                    Return
+                Catch ex As Exception When TypeOf ex Is IOException OrElse TypeOf ex Is UnauthorizedAccessException
+                    If intento = 5 Then Throw
+                    Threading.Thread.Sleep(100)
+                End Try
+            Next
+        End Sub
+
         Private Shared Function ComputeDiff(existingPath As String, bundle As List(Of VirtualEntry),
                                             requestedBa2Version As UInteger, kind As BucketKind,
                                             Optional excludePaths As HashSet(Of String) = Nothing) As DiffResult
@@ -1276,9 +1302,11 @@ Namespace BethesdaArchive.Core
                 End Try
 
                 ' Delete the source archive only after all its entries are safely on disk as loose.
-                ' The caller is expected to have unmounted any FilesDictionary handles for this
-                ' path BEFORE calling Unpack (see WM_PackUnpack.Unpack pre-unregister loop) so
-                ' File.Delete is not blocked by a sharing violation.
+                ' ⛔ EL PRE-UNREGISTER DEL LLAMADOR NO GARANTIZABA ESTO, contra lo que decia acá: sólo vacia
+                ' el pool, y un reader ALQUILADO en otro hilo mantiene su FileStream abierto todo el
+                ' ExtractToMemory. Lo que hace que este Delete funcione es que las lecturas de archive abren
+                ' con FileShare.Delete (ver FilesDictionary_class.AbrirArchiveParaLectura); el unregister
+                ' sigue siendo necesario, pero por otra razon (que no se sirvan entradas del archive viejo).
                 If archiveFullyExtracted Then
                     Try
                         File.Delete(archivePath)
