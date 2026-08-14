@@ -625,7 +625,9 @@ Namespace BethesdaArchive.Core
             ' expuesto a eso, y dura lo que tarde el ExtractToMemory en curso.
             Dim bakPath = archivePath & ".bak"
             BorrarConReintento(bakPath)
-            File.Move(archivePath, bakPath)
+            ' ⛔ EL Move TAMBIEN VA CON REINTENTO. Es el que de verdad se topa con el *delete pending*: el
+            ' nombre destino puede seguir ocupado por un handle que sobrevivio al flush anterior.
+            MoverConReintento(archivePath, bakPath)
 
             Try
                 ' The .bak reader (and its underlying FileStream) must stay open while WriteArchive
@@ -684,10 +686,26 @@ Namespace BethesdaArchive.Core
         ''' <see cref="UnauthorizedAccessException"/>, NO a <see cref="IOException"/> — atrapar sólo IO no
         ''' alcanzaba). Cinco intentos de 100 ms: la ventana dura lo que tarde el <c>ExtractToMemory</c> en
         ''' curso. Si igual no se puede, se deja tirar para que el llamador lo vea.</summary>
+        ''' <summary>Renombra tolerando *delete pending*, mismo motivo que <see cref="BorrarConReintento"/>.</summary>
+        Private Shared Sub MoverConReintento(origen As String, destino As String)
+            For intento = 1 To 5
+                Try
+                    File.Move(origen, destino)
+                    Return
+                Catch ex As Exception When TypeOf ex Is IOException OrElse TypeOf ex Is UnauthorizedAccessException
+                    If intento = 5 Then Throw
+                    Threading.Thread.Sleep(100)
+                End Try
+            Next
+        End Sub
+
         Private Shared Sub BorrarConReintento(path As String)
             For intento = 1 To 5
                 Try
-                    If Not File.Exists(path) Then Return
+                    ' ⛔ SIN `File.Exists`. Para un archivo en *delete pending* `GetFileAttributesEx` falla
+                    ' con ACCESS_DENIED y `File.Exists` devuelve False, asi que el guard tomaba el early
+                    ' return en la PRIMERA vuelta y el reintento no corria nunca en el estado para el que se
+                    ' escribio. `File.Delete` sobre un archivo inexistente ya es un no-op.
                     File.Delete(path)
                     Return
                 Catch ex As Exception When TypeOf ex Is IOException OrElse TypeOf ex Is UnauthorizedAccessException
@@ -1288,6 +1306,12 @@ Namespace BethesdaArchive.Core
                                     File.Move(outPath, conflictBak)
                                 End If
 
+                                ' ⛔ UN EXTRACT VACIO NO HABILITA EL BORRADO DEL ARCHIVE. `ExtractToMemory`
+                                ' de una entrada DX10 devuelve 0 bytes si el wrapper nativo no carga; sin
+                                ' esto se escribia un .dds vacio por textura y despues se borraba el .ba2,
+                                ' que era la unica copia. Se sigue escribiendo lo que haya (el resto del
+                                ' unpack es util) pero el archive NO se borra.
+                                If bytes.Length = 0 Then archiveFullyExtracted = False
                                 File.WriteAllBytes(outPath, bytes)
                                 result.LooseFilesWritten.Add(outPath)
 
