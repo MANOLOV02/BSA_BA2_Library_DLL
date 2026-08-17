@@ -6,7 +6,7 @@
     <StartupObject>Sub Main</StartupObject>
     <UseWindowsForms>true</UseWindowsForms>
     <MyType>WindowsForms</MyType>
-    <Configurations>Debug;Release</Configurations>
+    <Configurations>Debug;Release;Publish</Configurations>
     <Platforms>x86;x64</Platforms>
   </PropertyGroup>
 
@@ -54,4 +54,7 @@
    <!-- Fija la plataforma del wrapper NATIVO. Va en LOS SEIS proyectos, no solo en los dos que lo
        referencian de verdad: el SDK inyecta el ProjectReference transitivo sin la metadata. Ver el .targets. -->
   <Import Project="..\..\DirectXTextWrapper\DirectXTexWrapper.targets" />
+  <!-- La configuracion Publish: es Release con carpeta propia. Sin esto compilaria SIN
+       OPTIMIZAR, en verde. Ver el comentario del .targets. -->
+  <Import Project="..\FO4_Base_Library\ConfiguracionPublish.targets" />
 </Project>
