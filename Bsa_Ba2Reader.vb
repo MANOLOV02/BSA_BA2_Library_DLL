@@ -1,5 +1,4 @@
 ﻿Option Strict On
-' Version Uploaded of Wardrobe 2.1.3
 Imports System.IO
 Imports System.Runtime
 Imports System.Text
@@ -16,14 +15,12 @@ Namespace BethesdaArchive.Core
     Friend Module Ba2ReaderLimits
         Friend Const MaxPreAllocBytes As Long = 256L * 1024L * 1024L
         ''' <summary>Cota SUPERIOR DEMOSTRABLE de expansión de un bloque comprimido, en veces.
-        ''' <para>⛔ NO es "un margen holgado": es el máximo del FORMATO. Un bloque deflate puede
+        ''' <para>NO es "un margen holgado": es el máximo del FORMATO. Un bloque deflate puede
         ''' expandirse a lo sumo 1032:1 (una secuencia de 258 bytes de match codificada en ~2 bits ⇒
         ''' 258/0,25). LZ4 tiene un tope menor (~255:1), así que 1032 los cubre a los dos.</para>
-        ''' <para>⛔ ESTO CORRIGE UNA AFIRMACIÓN FALSA que estuvo escrita acá: que 32:1 "está por encima
-        ''' de cualquier ratio real de zlib sobre texturas". NO lo está. Un chunk de DDS uniforme —un
-        ''' facetint plano, un _s negro, un mip 1x1— comprime muchísimo más que 32:1, y con el techo viejo
-        ''' `fs.Length * 32` esos casos apagaban el pre-alloc, que es exactamente lo que la optimización
-        ''' venía a resolver. El número correcto no se elige: lo fija el formato.</para></summary>
+        ''' <para>⚠️ Un límite fijo tipo ×32 NO alcanza: un chunk de DDS uniforme (facetint plano,
+        ''' _s negro, mip 1x1) comprime muchísimo más que 32:1 y ese techo apagaría el pre-alloc
+        ''' justo en esos casos. El número correcto lo fija el formato, no se elige a ojo.</para></summary>
         Friend Const MaxBlockExpansion As Long = 1032L
     End Module
     Public Class BethesdaReader
@@ -85,16 +82,13 @@ Namespace BethesdaArchive.Core
         Private Shared Function DetectAndOpen(fs As Stream, enc As Encoding) As IArchiveImpl
             If Not fs.CanSeek Then Throw New ArgumentException("El Stream debe soportar Seek")
             Dim start = fs.Position
-            ' BA2-016: single 4-byte magic read, then compare both ways (was: ASCII for BA2,
-            ' ReadUInt32 for BSA). Detection only — no bytes are written; the chosen impl is
-            ' identical. BA2 "BTDX" = 42 54 44 58; BSA "BSA\0" = 42 53 41 00 (u32 LE 0x00415342).
+            ' BA2-016: single 4-byte magic read, then compare both ways — detection only, no bytes
+            ' are written. BA2 "BTDX" = 42 54 44 58; BSA "BSA\0" = 42 53 41 00 (u32 LE 0x00415342).
             Using br As New BinaryReader(fs, enc, leaveOpen:=True)
                 If fs.Length - fs.Position >= 4 Then
                     Dim magicBytes = br.ReadBytes(4)
                     fs.Position = start
-                    ' BA2: "BTDX" (ASCII), same comparison as before.
                     If Encoding.ASCII.GetString(magicBytes) = "BTDX" Then Return New Ba2Impl(fs, enc)
-                    ' BSA: u32 LE 0x00415342, same comparison as before.
                     If BitConverter.ToUInt32(magicBytes, 0) = &H415342UI Then Return New BsaImpl(fs, enc)
                 End If
             End Using
@@ -270,11 +264,9 @@ Namespace BethesdaArchive.Core
             ' NO chequear inflater.IsFinished acá. El chunk header del BA2 trae el tamaño descomprimido
             ' EXACTO, así que el truncamiento ya está cubierto arriba (total <> expected). El inflater se
             ' detiene a propósito en 'expected' bytes de OUTPUT, ANTES de consumir el trailer Adler-32 del
-            ' zlib, por lo que IsFinished es legítimamente False para chunks FO4 VÁLIDOS. Un
-            ' "If Not IsFinished Then Throw" (intento BA2-005) rechazaba entradas reales de
-            ' Fallout4 - Animations.ba2 — verificado 2026-06-13 con Tools/StateInfoOffsetProbe (todos los
-            ' extract de behavior .hkx lanzaban antes del revert). Formato length-prefixed → el check de
-            ' longitud es el guard correcto, no IsFinished.
+            ' zlib, por lo que IsFinished es legítimamente False para chunks FO4 válidos (p.ej. los
+            ' behavior .hkx de Fallout4 - Animations.ba2, que con un "If Not IsFinished Then Throw"
+            ' rechazan aunque sean válidos). El check de longitud es el guard correcto, no IsFinished.
             Return outBytes
         End Function
 
@@ -359,7 +351,7 @@ Namespace BethesdaArchive.Core
             Public Offset As UInteger         ' ABSOLUTO
             Public SizeField As UInteger      ' con bits 30/31
             Public Compressed As Boolean
-            Public HasEmbeddedName As Boolean ' <<< NUEVO
+            Public HasEmbeddedName As Boolean
             Public FileHash As ULong          ' hash TES4 de 64-bit del archivo (stored)
             Public DirHash As ULong           ' hash TES4 de 64-bit de la carpeta (stored)
         End Class
@@ -472,7 +464,7 @@ Namespace BethesdaArchive.Core
                     _records.Add(New FileRec With {
     .Index = idx, .Directory = dirName, .FileName = fileName,
     .Offset = offAbs, .SizeField = sizeField, .Compressed = comp,
-    .HasEmbeddedName = embedNames,   ' <<< SIEMPRE según flag 0x100
+    .HasEmbeddedName = embedNames,
     .FileHash = fhash, .DirHash = folderHashes(d)
 })
                     idx += 1
@@ -736,37 +728,19 @@ Namespace BethesdaArchive.Core
                 ' Orden físico por Offset por robustez (no debería alterar si ya viene ordenado)
                 Dim ordered = Chunks.OrderBy(Function(c) c.Offset).ToList()
 
-                    ' ⛔ CAPACIDAD EXACTA, que YA se conoce. Sin ella el MemoryStream arranca en 0 y crece
-                    ' DUPLICANDO: para una textura de 22 MB son ~8 realocaciones, y cada buffer intermedio
-                    ' de mas de 85 KB queda tirado en el LOH. Con miles de extracciones por bake eso es
-                    ' cientos de GB de trafico de LOH para entregar los mismos bytes. `DecompressedSize`
-                    ' de cada chunk viene del header y ya esta leido.
+                ' Capacidad EXACTA del MemoryStream desde DecompressedSize de cada chunk (ya leído del
+                ' header) — sin esto el stream arranca en 0 y duplica buffers al crecer, generando
+                ' tráfico de LOH grande con miles de extracciones por bake.
                 Dim capacidad As Long = 0
-                ' ⛔ SE ACOTA POR CHUNK CONTRA SU PROPIO `CompressedSize`. `DecompressedSize` es un campo
-                ' del HEADER y no lo valida nadie, y la app se distribuye y abre archives ajenos.
-                ' ⛔ EL CASO HOSTIL ES POR DEBAJO DE LOS 256 MB, no por encima. Un .ba2 de 1 KB que declare
-                ' 250 MB pasaba el techo del formato sin despeinarse, y `FilesDictionary` extrae con
-                ' `Parallel.ForEach` SIN MaxDegreeOfParallelism: 12 hilos × 250 MB = 3 GB reservados ANTES
-                ' de leer un byte, OOM en un equipo de 8 GB. (Un header que declara ~2e9 NO era el problema:
-                ' `MaxPreAllocBytes` ya lo llevaba a 0. Eso estuvo escrito aca y era falso.)
-                ' El pre-alloc es una OPTIMIZACION: si el numero no es creible se cae a 0 y el stream crece
-                ' solo, que es el comportamiento de siempre.
-                ' ⚠️ HUECO CONOCIDO Y NO CERRADO ACA: `ZlibStrict`/`Lz4Strict`, unas lineas mas abajo,
-                ' reservan `CInt(ch.DecompressedSize)` por chunk y por hilo con el MISMO campo sin acotar.
-                ' Este pre-alloc NO protege de eso. Acotarlos alli cambiaria comportamiento observable
-                ' (pasarian a RECHAZAR chunks que hoy descomprimen), asi que es una decision del usuario.
-                ' ⛔ LA COTA ES POR CHUNK, NO GLOBAL CONTRA `fs.Length`. Las dos formas anteriores estaban
-                ' mal, y las dos las escribi yo:
-                '   · `capacidad > fs.Length` compara el tamaño DESCOMPRIMIDO contra el archive COMPRIMIDO,
-                '     asi que apagaba el pre-alloc justo en los archives que mejor comprimen — que son el
-                '     caso que la optimizacion perseguia.
-                '   · `fs.Length * 32` heredaba el mismo defecto con otro nombre: un BA2 chico de contenido
-                '     muy uniforme supera 32:1 sin ninguna corrupcion (ver `MaxBlockExpansion`).
-                ' El unico numero que acota de verdad es `CompressedSize` del chunk: son bytes que EXISTEN
-                ' en el archivo, y un bloque comprimido no puede expandirse mas de `MaxBlockExpansion`
-                ' veces. Un chunk sin comprimir se acota contra `fs.Length` porque sus bytes estan crudos en
-                ' el archivo. Encima queda el techo del FORMATO (`MaxPreAllocBytes`, 256 MB: ninguna textura
-                ' de estos juegos se acerca — un 4096x4096 BC7 con mips son ~22 MB).
+                ' El acotado es POR CHUNK contra su propio CompressedSize (bytes reales en el archivo) ×
+                ' MaxBlockExpansion — NUNCA contra DecompressedSize crudo (nadie lo valida; la app abre
+                ' archives ajenos), ni contra una cota global (fs.Length) ni un multiplicador fijo como
+                ' ×32: esas dos formas apagan el pre-alloc justo en archives chicos que comprimen muy
+                ' bien (textura uniforme, facetint plano). Chunk sin comprimir → cota contra fs.Length
+                ' (bytes crudos en el archivo). Techo del formato: MaxPreAllocBytes (256 MB, ninguna
+                ' textura de estos juegos se acerca).
+                ' ⚠️ Hueco conocido: ZlibStrict/Lz4Strict (abajo) reservan DecompressedSize por chunk SIN
+                ' este acotado — decisión pendiente del usuario, cerrarlo cambiaría qué chunks se aceptan hoy.
                 For Each c In ordered
                     Dim declarado As Long = CLng(c.DecompressedSize)
                     Dim creible As Long
@@ -916,37 +890,19 @@ Namespace BethesdaArchive.Core
                 ' Los chunks DX10 pueden no venir en orden lógico de mips; ordenamos por MipFirst asc
                 Dim ordered = Chunks.OrderBy(Function(c) CInt(c.MipFirst)).ThenBy(Function(c) CLng(c.Offset)).ToList()
 
-                    ' ⛔ CAPACIDAD EXACTA, que YA se conoce. Sin ella el MemoryStream arranca en 0 y crece
-                    ' DUPLICANDO: para una textura de 22 MB son ~8 realocaciones, y cada buffer intermedio
-                    ' de mas de 85 KB queda tirado en el LOH. Con miles de extracciones por bake eso es
-                    ' cientos de GB de trafico de LOH para entregar los mismos bytes. `DecompressedSize`
-                    ' de cada chunk viene del header y ya esta leido.
+                ' Capacidad EXACTA del MemoryStream desde DecompressedSize de cada chunk (ya leído del
+                ' header) — sin esto el stream arranca en 0 y duplica buffers al crecer, generando
+                ' tráfico de LOH grande con miles de extracciones por bake.
                 Dim capacidad As Long = ddsHeader.Length
-                ' ⛔ SE ACOTA POR CHUNK CONTRA SU PROPIO `CompressedSize`. `DecompressedSize` es un campo
-                ' del HEADER y no lo valida nadie, y la app se distribuye y abre archives ajenos.
-                ' ⛔ EL CASO HOSTIL ES POR DEBAJO DE LOS 256 MB, no por encima. Un .ba2 de 1 KB que declare
-                ' 250 MB pasaba el techo del formato sin despeinarse, y `FilesDictionary` extrae con
-                ' `Parallel.ForEach` SIN MaxDegreeOfParallelism: 12 hilos × 250 MB = 3 GB reservados ANTES
-                ' de leer un byte, OOM en un equipo de 8 GB. (Un header que declara ~2e9 NO era el problema:
-                ' `MaxPreAllocBytes` ya lo llevaba a 0. Eso estuvo escrito aca y era falso.)
-                ' El pre-alloc es una OPTIMIZACION: si el numero no es creible se cae a 0 y el stream crece
-                ' solo, que es el comportamiento de siempre.
-                ' ⚠️ HUECO CONOCIDO Y NO CERRADO ACA: `ZlibStrict`/`Lz4Strict`, unas lineas mas abajo,
-                ' reservan `CInt(ch.DecompressedSize)` por chunk y por hilo con el MISMO campo sin acotar.
-                ' Este pre-alloc NO protege de eso. Acotarlos alli cambiaria comportamiento observable
-                ' (pasarian a RECHAZAR chunks que hoy descomprimen), asi que es una decision del usuario.
-                ' ⛔ LA COTA ES POR CHUNK, NO GLOBAL CONTRA `fs.Length`. Las dos formas anteriores estaban
-                ' mal, y las dos las escribi yo:
-                '   · `capacidad > fs.Length` compara el tamaño DESCOMPRIMIDO contra el archive COMPRIMIDO,
-                '     asi que apagaba el pre-alloc justo en los archives que mejor comprimen — que son el
-                '     caso que la optimizacion perseguia.
-                '   · `fs.Length * 32` heredaba el mismo defecto con otro nombre: un BA2 chico de contenido
-                '     muy uniforme supera 32:1 sin ninguna corrupcion (ver `MaxBlockExpansion`).
-                ' El unico numero que acota de verdad es `CompressedSize` del chunk: son bytes que EXISTEN
-                ' en el archivo, y un bloque comprimido no puede expandirse mas de `MaxBlockExpansion`
-                ' veces. Un chunk sin comprimir se acota contra `fs.Length` porque sus bytes estan crudos en
-                ' el archivo. Encima queda el techo del FORMATO (`MaxPreAllocBytes`, 256 MB: ninguna textura
-                ' de estos juegos se acerca — un 4096x4096 BC7 con mips son ~22 MB).
+                ' El acotado es POR CHUNK contra su propio CompressedSize (bytes reales en el archivo) ×
+                ' MaxBlockExpansion — NUNCA contra DecompressedSize crudo (nadie lo valida; la app abre
+                ' archives ajenos), ni contra una cota global (fs.Length) ni un multiplicador fijo como
+                ' ×32: esas dos formas apagan el pre-alloc justo en archives chicos que comprimen muy
+                ' bien (textura uniforme, facetint plano). Chunk sin comprimir → cota contra fs.Length
+                ' (bytes crudos en el archivo). Techo del formato: MaxPreAllocBytes (256 MB, ninguna
+                ' textura de estos juegos se acerca).
+                ' ⚠️ Hueco conocido: ZlibStrict/Lz4Strict (abajo) reservan DecompressedSize por chunk SIN
+                ' este acotado — decisión pendiente del usuario, cerrarlo cambiaría qué chunks se aceptan hoy.
                 For Each c In ordered
                     Dim declarado As Long = CLng(c.DecompressedSize)
                     Dim creible As Long
@@ -1186,7 +1142,7 @@ Namespace BethesdaArchive.Core
                 End Select
             Next
 
-            ' Name table (como lo tenías: Int16 + bytes usando _enc)
+            ' Name table: u16 length + bytes (encoding _enc), uno por entry en el mismo orden que _entries
             If _hdr.NameTableOffset > 0UL Then
                 _fs.Position = CLng(_hdr.NameTableOffset)
                 For i = 0 To _entries.Count - 1

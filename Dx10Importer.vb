@@ -100,7 +100,7 @@ Namespace BethesdaArchive.Core
 
             Dim bytes = File.ReadAllBytes(ddsPath)
             ' Signature is MakeRelativeUnderDataRoot(absPath, dataRoot): the absolute DDS path
-            ' first, the data root second. (Previously these were swapped.)
+            ' first, the data root second.
             Dim rel As String = PathUtil.MakeRelativeUnderDataRoot(ddsPath, dataRoot)
             Return FromDdsBytes(bytes, rel)
         End Function

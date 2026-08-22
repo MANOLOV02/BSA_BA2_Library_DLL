@@ -67,7 +67,7 @@ Namespace BethesdaArchive.Core
                     Return New Byte(7) {} ' cero
                 End If
 
-                Dim h = Tes4HashDirectoryBytes(stem) ' << mantiene tu función actual
+                Dim h = Tes4HashDirectoryBytes(stem) ' reutiliza el hash de directorio sobre el stem (sin extensión)
 
                 Dim crcBase As UInteger = BitConverter.ToUInt32(h, 4)
                 Dim add As UInteger = Crc1003F(GetBytesLatin1(ext))
@@ -76,7 +76,7 @@ Namespace BethesdaArchive.Core
                 Dim crcBytes = BitConverter.GetBytes(crcBase)
                 Buffer.BlockCopy(crcBytes, 0, h, 4, 4)
 
-                ' LUT de extensiones (mismos ajustes de bytes que tenías)
+                ' LUT de extensiones (tabla exacta que usa el motor)
                 Dim lut = New String() {"", ".nif", ".kf", ".dds", ".wav", ".adp"}
                 Dim i As Integer = Array.IndexOf(lut, ext)
                 If i >= 0 Then
@@ -162,7 +162,7 @@ Namespace BethesdaArchive.Core
 
             ' ---- Sumas "raw" para header ----
             ' FolderNameLength (campo del header) debe ser: sum(rawLenDir) + folderCount
-            ' (tu lector calcula dirStrSz = FolderNameLength + FolderCount → da raw + 2*folders = bytes reales de BZString)
+            ' (el lector, BsaImpl.Open, calcula dirStrSz = FolderNameLength + FolderCount → da raw + 2*folders = bytes reales de BZString)
             Dim folderNamesRawSum As Integer = groups.Sum(Function(g) enc.GetByteCount(If(g.Key, "")))
             Dim fileNamesRawSum As Integer = entries.Sum(Function(e) enc.GetByteCount(e.FileName))
 
@@ -187,7 +187,7 @@ Namespace BethesdaArchive.Core
                 Next
             End If
 
-            ' Región "filesOffset" (como la usa tu BsaImpl.Open): [por carpeta: BZString?] + [N * 16]
+            ' Región "filesOffset" (como la usa BsaImpl.Open): [por carpeta: BZString?] + [N * 16]
             Dim filesOffset As Long = posAfterDirEntries
             Dim fileEntriesBytes As Long = CLng(FILE_ENTRY_SIZE) * fileCount
             Dim posFileNameStrings As Long = filesOffset + dirBzTotal + fileEntriesBytes
@@ -373,7 +373,8 @@ Namespace BethesdaArchive.Core
                 output.Write(BitConverter.GetBytes(CUInt(g.Count())), 0, 4)         ' u32 count
                 output.Write(BitConverter.GetBytes(0UI), 0, 4)                      ' unused
 
-                ' *** CAMBIO: offset debe incluir totalFileNameLength del HEADER ***
+                ' El offset de DIRECTORY ENTRIES es el inicio real del bloque + FileNameLength total
+                ' del header: así layoutea este campo el formato BSA v105 (no es un error si "sobra").
                 Dim firstEntryAbs As UInteger = offsetFileEntryByDir(g.Key)
                 Dim offsetField As UInteger = offsetFolderBlockByDir(g.Key) + header_FileNameLength
                 output.Write(BitConverter.GetBytes(offsetField), 0, 4)              ' u32 offset (con +FileNameLength)

@@ -5,8 +5,8 @@ Namespace BethesdaArchive.Core
 
     ''' <summary>
     ''' Behavior when the bundle does not fit a single archive under MaxArchiveBytes.
-    ''' SplitByPlugin is reserved for the next phase (numbered companion plugins);
-    ''' Pack currently treats Overflow as advisory — it does not enforce MaxArchiveBytes yet.
+    ''' ThrowOnExceed throws InvalidOperationException. SplitByPlugin creates a new numbered
+    ''' companion plugin slot (e.g. "&lt;base&gt;2.esp") and continues distributing there.
     ''' </summary>
     Public Enum ArchiveOverflowPolicy
         ThrowOnExceed
@@ -14,12 +14,9 @@ Namespace BethesdaArchive.Core
     End Enum
 
     Public NotInheritable Class PackagerRequest
-        ''' <summary>⭐ EL TOPE DE ARCHIVO, ESCRITO UNA VEZ. 3 GiB, el límite del formato.
-        ''' <para>⛔ Estaba en TRES constantes privadas, en dos ortografías que ningún grep une:
-        ''' <c>MAX_ARCHIVE_BYTES = 3L &lt;&lt; 30</c> en <c>NpcFaceGenPacker</c> y
-        ''' <c>MAX_BYTES_FO4</c>/<c>MAX_BYTES_SSE = 3L * 1024L * 1024L * 1024L</c> en
-        ''' <c>WM_PackUnpack</c> — más este default. Cuatro sitios para un número del formato, que no es
-        ''' una preferencia de cada app. Buscar uno no encontraba los otros.</para></summary>
+        ''' <summary>Tope de archivo por defecto: 3 GiB. Margen de estabilidad de motor usado por
+        ''' las apps que empaquetan (WM, NPC Manager) — no es una preferencia de cada app, así que
+        ''' vive UNA sola vez acá.</summary>
         ''' <para>⚠️ `Shared ReadOnly` y NO `Const`: un `Const` lo INLINEA el compilador en cada EXE, asi que
 ''' una DLL nueva con otro tope no llegaria a un ejecutable que no se recompile. Asi viaja de verdad.</para>
         Public Shared ReadOnly MaxArchiveBytesDefault As Long = 3L << 30
@@ -38,8 +35,8 @@ Namespace BethesdaArchive.Core
         Public Property ModBaseName As String = "WM_ClonePack"
         Public Property OutputDir As String = ""
         Public Property Entries As List(Of VirtualEntry)
-        ' Soft cap per archive. ⛔ El doc decia "FO4 = 3GB, SSE = 2GB" y era FALSO: los tres sitios que lo
-        ' fijaban usaban 3 GiB para los DOS juegos. El limite duro del BSA sigue siendo 4GB (offsets u32).
+        ' Soft cap per archive: 3 GiB by default for BOTH games (see MaxArchiveBytesDefault). The
+        ' BSA hard limit remains 4 GB (u32 offsets) regardless of this setting.
         ' When a bundle exceeds this, Pack distributes entries across numbered companion plugins
         ' ("WM_ClonePack2.esp", "WM_ClonePack3.esp", ...) so the engine auto-loads each pair.
         Public Property MaxArchiveBytes As Long = MaxArchiveBytesDefault
@@ -680,12 +677,6 @@ Namespace BethesdaArchive.Core
         ' size + CRC32. CRC32 of existing entries forces a decompression pass — only paid once
         ' per Pack and only for paths that also appear in the bundle.
         ' --------------------------------------------------------------------------------------
-        ''' <summary>Borra un archivo tolerando *delete pending*: si un handle abierto con
-        ''' <c>FileShare.Delete</c> todavia no cerro, el nombre sigue existiendo hasta que lo haga y un
-        ''' borrado nuevo sobre ese nombre falla con ERROR_DELETE_PENDING (que .NET traduce a
-        ''' <see cref="UnauthorizedAccessException"/>, NO a <see cref="IOException"/> — atrapar sólo IO no
-        ''' alcanzaba). Cinco intentos de 100 ms: la ventana dura lo que tarde el <c>ExtractToMemory</c> en
-        ''' curso. Si igual no se puede, se deja tirar para que el llamador lo vea.</summary>
         ''' <summary>Renombra tolerando *delete pending*, mismo motivo que <see cref="BorrarConReintento"/>.</summary>
         Private Shared Sub MoverConReintento(origen As String, destino As String)
             For intento = 1 To 5
@@ -699,13 +690,19 @@ Namespace BethesdaArchive.Core
             Next
         End Sub
 
+        ''' <summary>Borra un archivo tolerando *delete pending*: si un handle abierto con
+        ''' <c>FileShare.Delete</c> todavia no cerro, el nombre sigue existiendo hasta que lo haga y un
+        ''' borrado nuevo sobre ese nombre falla con ERROR_DELETE_PENDING (que .NET traduce a
+        ''' <see cref="UnauthorizedAccessException"/>, NO a <see cref="IOException"/> — atrapar sólo IO no
+        ''' alcanzaba). Cinco intentos de 100 ms: la ventana dura lo que tarde el <c>ExtractToMemory</c> en
+        ''' curso. Si igual no se puede, se deja tirar para que el llamador lo vea.</summary>
         Private Shared Sub BorrarConReintento(path As String)
             For intento = 1 To 5
                 Try
-                    ' ⛔ SIN `File.Exists`. Para un archivo en *delete pending* `GetFileAttributesEx` falla
-                    ' con ACCESS_DENIED y `File.Exists` devuelve False, asi que el guard tomaba el early
-                    ' return en la PRIMERA vuelta y el reintento no corria nunca en el estado para el que se
-                    ' escribio. `File.Delete` sobre un archivo inexistente ya es un no-op.
+                    ' ⛔ SIN `File.Exists`. En un archivo en *delete pending*, `GetFileAttributesEx` falla
+                    ' con ACCESS_DENIED y `File.Exists` devuelve False — un guard así saltearía el
+                    ' reintento justo en el estado que existe para cubrir. `File.Delete` sobre un archivo
+                    ' inexistente ya es no-op, así que el guard no hace falta.
                     File.Delete(path)
                     Return
                 Catch ex As Exception When TypeOf ex Is IOException OrElse TypeOf ex Is UnauthorizedAccessException
@@ -1326,11 +1323,11 @@ Namespace BethesdaArchive.Core
                 End Try
 
                 ' Delete the source archive only after all its entries are safely on disk as loose.
-                ' ⛔ EL PRE-UNREGISTER DEL LLAMADOR NO GARANTIZABA ESTO, contra lo que decia acá: sólo vacia
-                ' el pool, y un reader ALQUILADO en otro hilo mantiene su FileStream abierto todo el
-                ' ExtractToMemory. Lo que hace que este Delete funcione es que las lecturas de archive abren
-                ' con FileShare.Delete (ver FilesDictionary_class.AbrirArchiveParaLectura); el unregister
-                ' sigue siendo necesario, pero por otra razon (que no se sirvan entradas del archive viejo).
+                ' Lo que hace que este Delete funcione con un reader posiblemente vivo en otro hilo es que
+                ' las lecturas de archive abren con FileShare.Delete (ver FilesDictionary_class.AbrirArchiveParaLectura),
+                ' no el unregister previo del llamador (que sólo vacía el pool) — el unregister sigue
+                ' siendo necesario, pero para que no se sirvan entradas del archive viejo, no para
+                ' habilitar este borrado.
                 If archiveFullyExtracted Then
                     Try
                         File.Delete(archivePath)

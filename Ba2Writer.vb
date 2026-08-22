@@ -23,7 +23,6 @@ Namespace BethesdaArchive.Core
         ' ====== Hashing BA2 exacto ======
         Private Shared ReadOnly Crc32Table As UInteger() = BuildCrc32Table()
         Friend Shared Sub Fo4SplitPath(norm As String, ByRef parent As String, ByRef stem As String, ByRef extNoDot As String)
-            ' Reimplementado usando PathUtil.SplitDirFile para unificar lógica de split.
             ' 1) Normalizar y recortar separadores extremos
             Dim relSlash As String = PathUtil.NormalizeSlash(norm).Trim(Correct_Path_separator, InCorrect_Path_separator)
             ' 2) Dividir en dir / archivo
@@ -174,15 +173,13 @@ Namespace BethesdaArchive.Core
         Friend Shared Function CompressZlib(data As Byte(), preset As ZlibPreset) As Byte()
             If data Is Nothing OrElse data.Length = 0 Then Return Array.Empty(Of Byte)()
 
-            ' ⛔ UN SOLO BUFFER PARA TODO EL ZLIB.
-            ' Antes esto hacia CUATRO pasadas del tamaño completo para agregar 6 bytes de cabecera y cola:
-            '   (1) `ms` sin capacidad, creciendo por duplicacion  -> basura de LOH
-            '   (2) `ms.ToArray()`                                 -> copia entera
-            '   (3) `outMs` TAMBIEN sin capacidad, duplicando otra vez -> mas basura de LOH
-            '   (4) `outMs.ToArray()`                              -> otra copia entera
-            ' Ahora el deflate se escribe DIRECTO adentro del buffer final, despues de los 2 bytes de
-            ' cabecera, y la cola del Adler se agrega al final: un solo array, sin copias intermedias.
-            ' Los bytes de salida son los mismos — es el mismo stream zlib.
+            ' ⛔ UN SOLO BUFFER PARA TODO EL ZLIB. Escribir a dos MemoryStream sin capacidad (uno
+            ' para el deflate, otro para agregarle cabecera+cola) hace CUATRO pasadas del tamaño
+            ' completo: cada `New MemoryStream()` sin capacidad duplica al crecer, y cada
+            ' `.ToArray()` copia entero — dos fuentes de basura de LOH por descarte. Acá el deflate
+            ' se escribe DIRECTO adentro del buffer final, después de los 2 bytes de cabecera, y la
+            ' cola del Adler se agrega al final: un solo array, sin copias intermedias. Los bytes de
+            ' salida son los mismos — es el mismo stream zlib.
             Dim cmfPre As Byte = &H78
             Dim flgPre As Byte
             Select Case preset
@@ -224,10 +221,10 @@ Namespace BethesdaArchive.Core
 
         Private Shared Function Adler32(data As Byte()) As UInteger
             Const MOD_ADLER As UInteger = 65521UI
-            ' ⛔ El `Mod` va por BLOQUE, no por byte. La version anterior hacia DOS divisiones por byte:
-            ' 44 millones de divisiones para una textura de 22 MB. 5552 es el maximo de iteraciones que
-            ' `b` aguanta sin desbordar 32 bits partiendo de a<65521 y bytes de 255 — es la constante
-            ' clasica de zlib (NMAX), no un numero elegido a ojo. El resultado es EL MISMO.
+            ' ⛔ El `Mod` va por BLOQUE, no por byte: hacerlo por byte son DOS divisiones por byte —
+            ' 44 millones de divisiones para una textura de 22 MB. 5552 es el máximo de iteraciones
+            ' que `b` aguanta sin desbordar 32 bits partiendo de a<65521 y bytes de 255 — es la
+            ' constante clásica de zlib (NMAX), no un número elegido a ojo. El resultado es el mismo.
             Dim a As UInteger = 1UI
             Dim b As UInteger = 0UI
             Const NMAX As Integer = 5552
@@ -343,9 +340,10 @@ Namespace BethesdaArchive.Core
             Public Property Encoding As Encoding = Encoding.UTF8
             ' FO4 admite v1, v7 y v8; default NG:
             Public Property Version As UInteger = 8UI
-            ' FO4 no usa CompressionCode en DX10; se deja por compat pero se IGNORA.
             Public Property IncludeStrings As Boolean = True
             Public Property ZlibPreset As Ba2WriterCommon.ZlibPreset = Ba2WriterCommon.ZlibPreset.Default
+            ' Sólo tiene efecto con Version=3 (LZ4 raw). En el resto de las versiones DX10
+            ' siempre comprime con ZLIB sin importar este valor.
             Public Property CompressionFormat As Ba2WriterCommon.CompressionFormat = Ba2WriterCommon.CompressionFormat.Zip
 
         End Class
@@ -362,9 +360,8 @@ Namespace BethesdaArchive.Core
 
         ''' <summary>
         ''' Escribe un BA2 DX10 (FO4 v1/v7/v8) en el stream de salida.
-        ''' Cada VirtualEntry debe tener Data lógico de archivo. Para DDS, Data puede ser el DDS
-        ''' completo (recomendado) o, por compatibilidad, el payload legacy sin cabecera. El writer
-        ''' deriva internamente el blob DX10 a partir del DDS cuando detecta el magic "DDS ".
+        ''' Cada VirtualEntry.Data debe ser el payload DDS SIN cabecera (ver Dx10Importer.FromDdsBytes);
+        ''' pasar el DDS completo (con magic "DDS ") lanza InvalidDataException.
         ''' Compresión: ZLIB (RFC1950). Si comp >= raw => store (CompressedSize = 0).
         ''' </summary>
         Public Shared Sub Write(output As Stream, entries As IEnumerable(Of VirtualEntry), opts As Options)
@@ -373,7 +370,6 @@ Namespace BethesdaArchive.Core
             If opts Is Nothing Then opts = New Options()
 
             ' Validación versión/compresión (DX10 soporta v1,7,8 y también v2/v3 según C++; LZ4 solo v3).
-            ' Mismo punto lógico que antes: antes de preparar metadata/payloads y de escribir bytes.
             Ba2WriterCommon.ValidateVersionAndCompression(opts.Version, opts.CompressionFormat, "DX10")
 
             Dim enc = If(opts.Encoding, Encoding.UTF8)
@@ -411,12 +407,10 @@ Namespace BethesdaArchive.Core
                 If ve.MipCount <= 0 Then Throw New InvalidDataException("DX10: MipCount inválido.")
                 If ve.Faces <= 0 Then Throw New InvalidDataException("DX10: Faces inválido.")
                 If ve.DxgiFormat < 0 OrElse ve.DxgiFormat > 255 Then Throw New InvalidDataException("DX10: DxgiFormat inválido (0..255).")
-                ' ⛔ ACÁ NO SE DERIVA NINGÚN "faces". Había un `Dim faces = If(ve.IsCubemap, 6, ve.Faces)`
-                ' que NO SE USABA — un local muerto, y muerto desde antes. Se sacó en vez de mantenerlo.
-                ' El motivo por el que no puede usarse: la entrada DX10 del BA2 NO TIENE campo de tamaño de
-                ' array. Lo único que lleva es `Dx10_Flags`, donde 1 = cubemap (ver abajo) más MipCount,
-                ' formato y TileMode. Un Texture2DArray de N elementos NO es representable en este formato,
-                ' así que no hay ningún header "mintiendo" que corregir: es un límite del contenedor.
+                ' No hay "faces" que derivar acá: la entrada DX10 del BA2 no tiene campo de tamaño de
+                ' array. Sólo lleva `Dx10_Flags` (1 = cubemap, ver abajo) más MipCount, formato y
+                ' TileMode — un Texture2DArray de N elementos no es representable en este formato;
+                ' es un límite del contenedor, no algo que corregir.
 
                 ' Hashes
                 Dim relNorm As String = PathUtil.JoinDirFile(ve.Directory, ve.FileName)
@@ -725,7 +719,6 @@ Namespace BethesdaArchive.Core
             Next
 
             ' ===== Header BA2 (v1/v2/v3/v7/v8) =====
-            ' Mismo punto lógico que antes: tras preparar metadata, justo antes de escribir bytes.
             Ba2WriterCommon.ValidateVersionAndCompression(opts.Version, opts.CompressionFormat, "GNRL")
 
             ' Preámbulo compartido GNRL/DX10. Solo cambia el tag de tipo ("GNRL") y el conteo.

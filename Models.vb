@@ -12,10 +12,11 @@ Namespace BethesdaArchive.Core
                 Return Directory.TrimEnd(Correct_Path_separator, InCorrect_Path_separator) & Correct_Path_separator & FileName
             End Get
         End Property
-        ' Contenido lógico completo del archivo. Ej.: para texturas DX10 contiene el DDS
-        ' completo con cabecera; el writer DX10 deriva internamente el payload del archive.
+        ' Contenido lógico completo del archivo. Para BA2 DX10, Data debe ser el payload DDS
+        ' SIN cabecera (ver Dx10Importer.FromDdsBytes; el writer lanza excepción si recibe el
+        ' DDS completo). BSA guarda el DDS completo verbatim como bytes opacos.
         Public Property Data As Byte()
-        Public Property PreferCompress As Boolean  ' Para BSA/BA2.GNRL
+        Public Property PreferCompress As Boolean  ' Sólo lo lee BSA (override del Compressed global); BA2 GNRL/DX10 lo ignoran.
 
         ' DX10 metadata
         Public Property DxgiFormat As Integer
