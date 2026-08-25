@@ -21,6 +21,12 @@ Namespace BethesdaArchive.Core
 ''' una DLL nueva con otro tope no llegaria a un ejecutable que no se recompile. Asi viaja de verdad.</para>
         Public Shared ReadOnly MaxArchiveBytesDefault As Long = 3L << 30
 
+        ''' <summary>Offset máximo que un BSA puede expresar: <b>2 GiB−1</b>.
+        ''' SYNC: <c>TES5Edit\Core\wbBSArchive.pas:162</c> <c>BSA_MAX_OFFSET = High(Integer)</c>, que es
+        ''' además lo que <c>DefaultSplitSize</c> devuelve para <c>baSSE</c> (<c>:1000-1005</c>).
+        ''' <para>NO aplica al BA2, que usa offsets de 64 bits. Ver el gate en <c>Pack</c>.</para></summary>
+        Public Shared ReadOnly BsaMaxOffset As Long = CLng(Integer.MaxValue)
+
         Public Property Game As GameKind
 
         ' BA2 header version written for FO4 archives (GNRL + DX10). FO4-only: IGNORED when
@@ -35,8 +41,9 @@ Namespace BethesdaArchive.Core
         Public Property ModBaseName As String = "WM_ClonePack"
         Public Property OutputDir As String = ""
         Public Property Entries As List(Of VirtualEntry)
-        ' Soft cap per archive: 3 GiB by default for BOTH games (see MaxArchiveBytesDefault). The
-        ' BSA hard limit remains 4 GB (u32 offsets) regardless of this setting.
+        ' Soft cap per archive: 3 GiB by default (see MaxArchiveBytesDefault). ⛔ Para BSA lo pisa
+        ' `Pack` a `BsaMaxOffset` (2 GiB−1, `wbBSArchive.pas:162`): NO son 4 GB. El BA2 sí usa offsets
+        ' de 64 bits y se queda en los 3 GiB.
         ' When a bundle exceeds this, Pack distributes entries across numbered companion plugins
         ' ("WM_ClonePack2.esp", "WM_ClonePack3.esp", ...) so the engine auto-loads each pair.
         Public Property MaxArchiveBytes As Long = MaxArchiveBytesDefault
@@ -195,6 +202,21 @@ Namespace BethesdaArchive.Core
             If String.IsNullOrWhiteSpace(req.OutputDir) Then Throw New ArgumentException("OutputDir is empty.", NameOf(req))
             If req.Entries Is Nothing Then Throw New ArgumentException("Entries is null.", NameOf(req))
             If req.MaxArchiveBytes <= 0 Then Throw New ArgumentException("MaxArchiveBytes must be positive.", NameOf(req))
+
+            ' ⛔ EL TOPE LO DECIDE EL FORMATO, NO UNA PREFERENCIA. Acá el default eran 3 GiB para LOS DOS
+            ' juegos, con un comentario que decía "the BSA hard limit remains 4 GB (u32 offsets)". Es
+            ' falso: el canon dice `BSA_MAX_OFFSET = High(Integer)` (`wbBSArchive.pas:162`), o sea
+            ' **2 GiB−1**, y `DefaultSplitSize` devuelve ese valor para `baSSE`. Su validación (`:1235`)
+            ' lo dice con todas las letras: *"N file(s) start above 2 GB max allowed BSA size, they won't
+            ' work or crash the game"*.
+            ' El BA2 sí usa offsets de 64 bits y se queda en los 3 GiB de siempre — por eso el tope se
+            ' baja SOLO en la rama BSA y FO4 no se mueve un byte.
+            ' MEDIDO hoy: 29 `WM_ClonePack*` de 3,00 GiB en el Data de FO4 (BA2, sanos) y 0 archives por
+            ' encima de 2 GiB−1 en SSE ⇒ el defecto es LATENTE, y el disparador es este mismo botón
+            ' apuntando a Skyrim, donde la app ya demostró 29 veces que llena hasta el tope.
+            If req.Game = GameKind.SSE_BSA AndAlso req.MaxArchiveBytes > PackagerRequest.BsaMaxOffset Then
+                req.MaxArchiveBytes = PackagerRequest.BsaMaxOffset
+            End If
 
             EnsureDir(req.OutputDir & Path.DirectorySeparatorChar)
 

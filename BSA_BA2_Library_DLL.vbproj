@@ -32,6 +32,14 @@
     <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
       <_Parameter1>TexCodecPerfProbe</_Parameter1>
     </AssemblyAttribute>
+    <!-- Tools/BsaHashGate: compara el hash TES4 que produce ESTA lib contra los hashes que Bethesda YA
+         ESCRIBIO en los BSA vanilla. Es la unica forma de que el gate PUEDA fallar: el que existia
+         (ArchivePackager.vb, anti-stale) compara el hash guardado contra la funcion de la app, o sea la
+         app validandose a si misma — y por eso no vio el `>= 2` donde wbHash.pas:224 dice `> 2`.
+         Necesita `BsaWriter.BASTes4Hashing` (Friend). NADA se vuelve Public. -->
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>BsaHashGate</_Parameter1>
+    </AssemblyAttribute>
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\DirectXTextWrapper\DirectXTexWrapper.vcxproj" />

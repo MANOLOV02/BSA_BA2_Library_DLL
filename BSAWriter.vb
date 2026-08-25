@@ -30,7 +30,21 @@ Namespace BethesdaArchive.Core
                 If String.IsNullOrEmpty(path) Then path = "."
                 Dim b = GetBytesLatin1(path)
                 Dim last As Byte = If(b.Length >= 1, b(b.Length - 1), CByte(0))
-                Dim last2 As Byte = If(b.Length >= 2, b(b.Length - 2), CByte(0))
+                ' ⛔ `> 2`, NO `>= 2`. SYNC: `TES5Edit\Core\wbHash.pas:222-225`
+                '     if l > 0 then hash1[0] := s[l];
+                '     if l > 2 then hash1[1] := s[l-1];      <-- ESTE
+                '                   hash1[2] := AnsiChar(l);
+                '     if l > 0 then hash1[3] := s[1];
+                ' Para un tronco de EXACTAMENTE 2 caracteres el motor deja este byte en 0 y la app ponía
+                ' la primera letra ⇒ hash distinto ⇒ el motor NO ENCUENTRA EL ARCHIVO.
+                ' Y entra por las dos puertas: `Tes4HashFileBytes` reutiliza esta función sobre el stem.
+                '
+                ' ⭐ PRUEBA INDEPENDIENTE DE LAS DOS IMPLEMENTACIONES, sobre hashes que Bethesda YA
+                ' escribió: los 100 BSA vanilla de Skyrim traen 264.632 hashes; el canónico reproduce
+                ' 264.632/264.632 y la app reproducía 264.605/264.632. Los 27 que fallaban son
+                ' exactamente los troncos de 2 letras: `lb/lt/rb/rt.png`, `up.hkx` (×19), `on.hkx` (×2),
+                ' `go.nif` (×2). Ver Tools\BsaHashGate.
+                Dim last2 As Byte = If(b.Length > 2, b(b.Length - 2), CByte(0))
                 Dim first As Byte = If(b.Length >= 1, b(0), CByte(0))
                 Dim length As Byte = CByte(Math.Min(b.Length, 255))
 

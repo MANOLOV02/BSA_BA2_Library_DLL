@@ -55,7 +55,14 @@ Namespace BethesdaArchive.Core
         ''' gasolinecanister) y dirs anidados de Creation Club.
         ''' </summary>
         Friend Shared Function Fo4PathHash(text As String) As UInteger
-            Dim bytes = Encoding.ASCII.GetBytes(text.ToLowerInvariant())
+            ' ⛔ NO `Encoding.ASCII`: reemplaza TODO byte > 127 por `?` (0x3F), así que un nombre con
+            ' acento se hashea como si fuera otro nombre — mientras la TABLA DE NOMBRES del archive se
+            ' escribe en UTF-8 (`Public Property Encoding As Encoding = Encoding.UTF8`). El canon hashea
+            ' sobre bytes ANSI; Latin1 los reproduce byte a byte en el rango que importa y, a diferencia
+            ' de ASCII, no destruye nada.
+            ' LATENTE, medido: 0 de 585.791 nombres del corpus tienen un byte alto ⇒ CERO bytes de
+            ' diferencia hoy. Alcanza UN archivo suelto con acento para dispararlo.
+            Dim bytes = Encoding.Latin1.GetBytes(text.ToLowerInvariant())
             Dim crc As UInteger = 0UI
             For Each bt In bytes
                 Dim idx = (crc Xor bt) And &HFFUI

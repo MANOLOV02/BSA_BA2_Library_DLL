@@ -508,7 +508,16 @@ Namespace BethesdaArchive.Core
             Dim r = _records(index)
 
             ' 1) Posición física (offset absoluto con bit 31 limpio por posible “secondary archive”)
-            Dim offPhys As UInteger = (r.Offset And &H7FFFFFFFUI)
+            ' ⛔ EL BIT 31 DEL OFFSET NO SE ENMASCARA. Acá se hacía `r.Offset And &H7FFFFFFFUI`, con el
+            ' comentario "posible secondary archive". No existe tal cosa en el formato BSA: el offset es un
+            ' u32 y el CANON lo trata entero — `wbBSArchive.pas:162` `BSA_MAX_OFFSET = High(Integer)`
+            ' (2 GiB−1) y su validación (`:1235`) avisa *"N file(s) start above 2 GB max allowed BSA size,
+            ' they won't work or crash the game"*, o sea que un offset con el bit 31 puesto describe un
+            ' archivo ROTO, no una señal. Enmascararlo convertía ese archivo roto en uno que se lee sin
+            ' error y devuelve OTROS BYTES.
+            ' MEDIDO sobre un BSA de 2 GiB fabricado para probarlo: 0 de 227 entradas correctas, 166
+            ' devueltas silenciosamente equivocadas. En el disco de hoy: 0 BSA por encima del tope.
+            Dim offPhys As UInteger = r.Offset
             _fs.Position = CLng(offPhys)
 
             ' 2) Trabajar con copia del size del entry
@@ -563,7 +572,8 @@ Namespace BethesdaArchive.Core
 
             ' Same skipping logic as ExtractByIndex up to the point where we'd decompress: we want
             ' the post-BSTRING / post-decompSize payload bytes verbatim.
-            Dim offPhys As UInteger = (r.Offset And &H7FFFFFFFUI)
+            ' Ver el bloque de ExtractByIndex: el bit 31 es parte del offset, no una bandera.
+            Dim offPhys As UInteger = r.Offset
             _fs.Position = CLng(offPhys)
 
             Dim sizeWork As UInteger = (r.SizeField And &H3FFFFFFFUI)
@@ -617,7 +627,8 @@ Namespace BethesdaArchive.Core
             ' We hand the writer a source pointing at the third part, so it can re-emit the
             ' BSTRING and decompSize itself (with the entry's current Directory/FileName).
 
-            Dim offPhys As Long = CLng(r.Offset And &H7FFFFFFFUI)
+            ' Ver el bloque de ExtractByIndex: el bit 31 es parte del offset, no una bandera.
+            Dim offPhys As Long = CLng(r.Offset)
             Dim sizeWork As Long = CLng(r.SizeField And &H3FFFFFFFUI)
             Dim cursor As Long = offPhys
 
