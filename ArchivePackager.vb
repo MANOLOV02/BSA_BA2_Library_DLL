@@ -22,7 +22,7 @@ Namespace BethesdaArchive.Core
         Public Shared ReadOnly MaxArchiveBytesDefault As Long = 3L << 30
 
         ''' <summary>Offset máximo que un BSA puede expresar: <b>2 GiB−1</b>.
-        ''' SYNC: <c>TES5Edit\Core\wbBSArchive.pas:162</c> <c>BSA_MAX_OFFSET = High(Integer)</c>, que es
+        ''' SYNC: <c>3rd party references\TES5Edit\Core\wbBSArchive.pas:162</c> <c>BSA_MAX_OFFSET = High(Integer)</c>, que es
         ''' además lo que <c>DefaultSplitSize</c> devuelve para <c>baSSE</c> (<c>:1000-1005</c>).
         ''' <para>NO aplica al BA2, que usa offsets de 64 bits. Ver el gate en <c>Pack</c>.</para></summary>
         Public Shared ReadOnly BsaMaxOffset As Long = CLng(Integer.MaxValue)

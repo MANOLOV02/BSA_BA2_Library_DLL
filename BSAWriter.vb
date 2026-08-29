@@ -30,7 +30,7 @@ Namespace BethesdaArchive.Core
                 If String.IsNullOrEmpty(path) Then path = "."
                 Dim b = GetBytesLatin1(path)
                 Dim last As Byte = If(b.Length >= 1, b(b.Length - 1), CByte(0))
-                ' ⛔ `> 2`, NO `>= 2`. SYNC: `TES5Edit\Core\wbHash.pas:222-225`
+                ' ⛔ `> 2`, NO `>= 2`. SYNC: `3rd party references\TES5Edit\Core\wbHash.pas:222-225`
                 '     if l > 0 then hash1[0] := s[l];
                 '     if l > 2 then hash1[1] := s[l-1];      <-- ESTE
                 '                   hash1[2] := AnsiChar(l);
