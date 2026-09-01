@@ -220,9 +220,32 @@ Namespace BethesdaArchive.Core
 
             EnsureDir(req.OutputDir & Path.DirectorySeparatorChar)
 
+            ' ⛔ LA RECUPERACION VA ACA, ANTES DEL CENSO. Vivia adentro de PackOneArchive — o sea despues de
+            ' DiscoverSlots, y detras del `Continue For` de EmitSlot que saltea el bucket sin trabajo. Tres
+            ' defectos salian de esa posicion, no del protocolo:
+            '   1. EL BUCKET SIN TRABAJO NUNCA REPARABA. Se cortaba el volcado del `- Textures.ba2`, la
+            '      corrida siguiente traia solo mallas, ese bucket no recibia entradas y el archive truncado
+            '      quedaba asi indefinidamente — con el juego cargandolo roto.
+            '   2. EL CENSO LEIA EL TRUNCADO. DiscoverSlots toma SizeByBucket del archivo cortado y deja
+            '      ExistingByBucket VACIO (su Catch trata el truncado como archive vacio). Una entrada que
+            '      vivia en el `.new` pendiente se censaba como inexistente y se re-distribuia a otro slot;
+            '      al recuperarse el `.new`, el MISMO path quedaba en DOS archives del set y se rompia el
+            '      contrato de no-duplicados del anclaje.
+            '   3. LA DISTRIBUCION DECIDIA CONTRA EL TAMAÑO TRUNCADO, asi que despues de recuperar el
+            '      archive podia superar MaxArchiveBytes — en la rama BSA eso es pasarse de 2 GiB−1, que es
+            '      crash del juego (ver el tope de aca arriba).
+            ' Barriendo el set ENTERO antes del censo, el censo lee el archive ya recuperado y las tres se
+            ' cierran juntas, sin maquinaria extra.
+            RecuperarVolcadosCortados(req)
+
             Dim result As New PackagerResult()
             ' Delete-only Pack: an empty bundle with ExcludePaths still runs (it strips the excluded entries
             ' from the existing target archive). Only a truly empty request (no entries AND no exclusions) is a no-op.
+            ' ⛔ EL NO-OP ES DE LA DISTRIBUCION, NO DE LA RECUPERACION: el barrido de arriba ya corrio. Si no
+            ' habia ningun par `.new`/sello pendiente, esta request vacia sigue siendo EXACTAMENTE el no-op
+            ' de siempre; si lo habia, se reparo o se tiro. Es deliberado: "esta corrida no trae trabajo" es
+            ' el caso degenerado del mismo defecto que "este bucket no trae trabajo", y un archive truncado
+            ' no se puede quedar roto porque justo el pack que lo encontro no tenia nada que escribir.
             If req.Entries.Count = 0 AndAlso (req.ExcludePaths Is Nothing OrElse req.ExcludePaths.Count = 0) Then Return result
 
             Dim buckets = BucketsForGame(req.Game)
@@ -613,14 +636,110 @@ Namespace BethesdaArchive.Core
             Return False
         End Function
 
-        ''' <summary>Levanta el `.new` que haya dejado un volcado cortado. Si abre como archive valido se
-        ''' vuelca sobre el destino (es la version terminada que no llego a comprometerse); si no abre, se
-        ''' descarta. En los dos casos el `.new` se borra: no se acumula.</summary>
-        ''' <summary>Sello que marca que un `.new` PASO su verificacion y por lo tanto se puede volcar a
-        ''' ciegas en la corrida siguiente. Sin el, un `.new` que quedo de un verify FALLIDO se levantaria
-        ''' como si fuera bueno.</summary>
+        ''' <summary>Sello que marca que un `.new` PASO su verificacion y por lo tanto se puede volcar en la
+        ''' corrida siguiente. Sin el, un `.new` que quedo de un verify FALLIDO se levantaria como si fuera
+        ''' bueno.</summary>
         Private Const SUFIJO_SELLO As String = ".ok"
 
+        ''' <summary>Extension de archive que le toca a cada bucket. El barrido la usa para no cruzar
+        ''' juegos: un mismo Data puede tener `G.bsa` y `G - Main.ba2` bajo el mismo base name, y un pack de
+        ''' FO4 no tiene por que meter mano en el archive de Skyrim.</summary>
+        Private Shared Function ExtensionDeBucket(bucket As BucketKind) As String
+            Select Case bucket
+                Case BucketKind.BA2_GNRL, BucketKind.BA2_DX10 : Return ".ba2"
+                Case BucketKind.BSA : Return EXT_BSA
+                Case Else : Throw New ArgumentOutOfRangeException(NameOf(bucket))
+            End Select
+        End Function
+
+        ''' <summary>Barre TODO el archive set del ModBaseName y recupera cada volcado cortado ANTES de que
+        ''' el censo lea un solo byte. Corre una vez por Pack (ver el ⛔ del llamador).
+        ''' <para>⛔ SE ENUMERA POR EL `.new`/SELLO, NO POR EL ARCHIVE. Un `.new` cuyo entregable ya no
+        ''' existe —lo borro el usuario, o lo borro la rama `emptiedByExclusion` de PackOneArchive— no
+        ''' aparece en DiscoverArchiveSet, asi que un barrido que partiera de los archives lo dejaria
+        ''' huerfano para siempre. Enumerar por el pendiente es enumerar por lo que hay que reparar.</para>
+        ''' <para>Los `.new`/`.ok` NO se cuelan como archives en ningun otro lado: el patron de
+        ''' DiscoverArchiveSet y de DiscoverSlots pide que el nombre TERMINE en `.ba2`/`.bsa`/`.esp`, y la
+        ''' extension efectiva de estos es `.new` y `.ok`.</para></summary>
+        Private Shared Sub RecuperarVolcadosCortados(req As PackagerRequest)
+            If Not Directory.Exists(req.OutputDir) Then Return
+
+            Dim buckets = BucketsForGame(req.Game)
+            ' Nombres de archive del slot 1, armados con la MISMA regla que usa el resto del packer
+            ' (ArchivePathFor sobre SlotName(1, ...)): es lo unico que se acepta con SingleAnchorOnly.
+            Dim slot1 As New PluginSlot With {.SlotNumber = 1, .BaseName = SlotName(1, req.ModBaseName)}
+            Dim nombresDeSlot1 As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+            Dim extensiones As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+            For Each b In buckets
+                nombresDeSlot1.Add(Path.GetFileName(ArchivePathFor(slot1, b, req.OutputDir)))
+                extensiones.Add(ExtensionDeBucket(b))
+            Next
+
+            Const SUF_NEW As String = ".new"
+            Dim candidatos As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
+            For Each ruta In Directory.EnumerateFiles(req.OutputDir, req.ModBaseName & "*", SearchOption.TopDirectoryOnly)
+                Dim nombre = Path.GetFileName(ruta)
+                Dim archivePath As String
+                If nombre.EndsWith(SUF_NEW & SUFIJO_SELLO, StringComparison.OrdinalIgnoreCase) Then
+                    archivePath = ruta.Substring(0, ruta.Length - (SUF_NEW & SUFIJO_SELLO).Length)
+                ElseIf nombre.EndsWith(SUF_NEW, StringComparison.OrdinalIgnoreCase) Then
+                    archivePath = ruta.Substring(0, ruta.Length - SUF_NEW.Length)
+                Else
+                    Continue For
+                End If
+
+                ' Que el entregable sea un archive de ESTE juego.
+                If Not extensiones.Contains(Path.GetExtension(archivePath)) Then Continue For
+
+                If req.SingleAnchorOnly Then
+                    ' ⛔ SingleAnchorOnly declara que los companion numerados "are not considered for
+                    ' anchoring nor for free-pass distribution, and their archives are never read or
+                    ' rewritten" (ver PackagerRequest.SingleAnchorOnly). Repararlos ES reescribirlos, asi
+                    ' que el barrido se queda en el slot 1. Lo que quede afuera lo cubre el llamado de
+                    ' respaldo que sigue estando en PackOneArchive.
+                    If Not nombresDeSlot1.Contains(Path.GetFileName(archivePath)) Then Continue For
+                ElseIf Not BelongsToModBaseName(Path.GetFileNameWithoutExtension(archivePath), req.ModBaseName) Then
+                    ' Coincidencia de prefijo sin la forma que escribe Pack ("<base>Legacy.ba2"): no es del set.
+                    Continue For
+                End If
+
+                candidatos.Add(archivePath)
+            Next
+
+            For Each archivePath In candidatos
+                RecuperarVolcadoCortado(archivePath)
+            Next
+        End Sub
+
+        ''' <summary>El manifiesto de un archive como lista de VirtualEntry de SOLA IDENTIDAD. Es todo lo
+        ''' que VerifyArchive necesita del bundle esperado y nada mas: verificado linea por linea, consume
+        ''' `expectedBundle.Count` y `NormalizePath(ve.FullPath)` — ni tamaño, ni CRC, ni payload. Las tres
+        ''' extracciones al azar las saca del archivo mismo, no de esta lista, asi que sintetizarla no
+        ''' debilita el control.</summary>
+        Private Shared Function EsperadasDelManifiesto(reader As BethesdaReader) As List(Of VirtualEntry)
+            Dim out As New List(Of VirtualEntry)()
+            If reader.EntriesFiles Is Nothing Then Return out
+            For Each ae In reader.EntriesFiles
+                out.Add(New VirtualEntry With {.Directory = ae.Directory, .FileName = ae.FileName})
+            Next
+            Return out
+        End Function
+
+        ''' <summary>Recupera el volcado cortado de UN archive, o deja todo exactamente como estaba. Los
+        ''' cuatro estados del par `.new`/sello:
+        ''' <list type="bullet">
+        ''' <item><b>sin `.new`, con sello</b> ⇒ sello huerfano, se borra;</item>
+        ''' <item><b>`.new` sin sello</b> ⇒ puede ser el de un verify FALLIDO: se descarta, no se vuelca;</item>
+        ''' <item><b>`.new` + sello</b> ⇒ se verifica el `.new`, se vuelca, se RE-VERIFICA el entregable, y
+        ''' recien ahi se limpia el par;</item>
+        ''' <item><b>ninguno</b> ⇒ no hay nada que hacer.</item></list>
+        ''' <para>⛔ EL `.new` NO SE BORRA HASTA QUE EL ENTREGABLE RE-ABRE LIMPIO. Antes se volcaba a ciegas
+        ''' —la sonda era `EntriesFiles.Count > 0`— y se borraba el par sin volver a mirar el destino: un
+        ''' volcado cortado por SEGUNDA vez se llevaba puesta la unica copia integra que quedaba.</para>
+        ''' <para>⛔ NO VUELVE EN SILENCIO CUANDO NO PUDO DEJAR EL ENTREGABLE VERIFICADO. El que sigue es
+        ''' DiscoverSlots, que censaria ese archive a medio volcar como VACIO — o sea el defecto que esta
+        ''' funcion existe para cerrar, reintroducido en la misma corrida. Falla LIMPIO y el par se
+        ''' conserva, que es la misma postura que el commit de PackOneArchive ya tenia.</para></summary>
         Private Shared Sub RecuperarVolcadoCortado(archivePath As String)
             Dim newPath = archivePath & ".new"
             Dim selloPath = newPath & SUFIJO_SELLO
@@ -636,27 +755,91 @@ Namespace BethesdaArchive.Core
                 BorrarConReintento(newPath)
                 Return
             End If
+
+            ' El `.new` es su propia lista esperada, y eso NO es una tautologia comoda: el sello es, por
+            ' definicion (ver donde lo escribe PackOneArchive), el registro de que la corrida muerta ya
+            ' corrio VerifyArchive(newPath, entriesToWrite) y PASO. Con el sello puesto, "manifiesto del
+            ' `.new`" ES "entriesToWrite de la corrida muerta". Lo que el verify completo agrega sobre la
+            ' sonda vieja de `Count > 0` son las tres extracciones al azar — justo lo que un `.new` cortado
+            ' no aguanta, y lo que la sonda vieja no miraba.
+            Dim esperadas As List(Of VirtualEntry) = Nothing
             Try
                 Using fs = New FileStream(newPath, FileMode.Open, FileAccess.Read,
                                           FileShare.Read Or FileShare.Delete)
                     Using probe As New BethesdaReader(fs)
-                        If probe.EntriesFiles Is Nothing OrElse probe.EntriesFiles.Count = 0 Then
-                            Throw New InvalidDataException("empty archive")
-                        End If
+                        esperadas = EsperadasDelManifiesto(probe)
                     End Using
                 End Using
-                EscrituraEnElLugar.VolcarEncima(newPath, archivePath)
-            Catch
-                ' No se pudo volcar (destino tomado, sin permisos) o el `.new` no abre: si NO se pudo
-                ' volcar, es la UNICA copia integra del archive nuevo y se CONSERVA — borrarlo dejaba al
-                ' usuario con el archive truncado y sin nada para recuperar.
-                Return
+                ' VerifyArchive contra una lista vacia pasa trivialmente (0 = 0, cero extracciones), asi que
+                ' el archive sin entradas se rechaza ACA, como lo hacia la sonda vieja.
+                If esperadas.Count = 0 Then Throw New InvalidDataException("archive sin entradas")
+                VerifyArchive(newPath, esperadas)
+            Catch ex As Exception
+                ' ⛔ UN `.new` SELLADO QUE HOY NO VERIFICA NO SE VUELCA NI SE BORRA. El sello dice que su
+                ' verify paso en otra corrida; si hoy no pasa, el disco cambio abajo nuestro y no sabemos
+                ' cual de los dos archivos es el sano. Es la misma ley que EscrituraEnElLugar aplica en
+                ' GuardarConCopia: sin red no se trunca.
+                Throw New InvalidDataException(
+                    $"'{Path.GetFileName(newPath)}' sello su verify en otra corrida y hoy NO verifica: el " &
+                    $"disco cambio abajo. No se vuelca sobre '{Path.GetFileName(archivePath)}' ni se borra " &
+                    "— es la unica copia. Si el problema persiste, borra los dos a mano y re-empaqueta.", ex)
             End Try
+
+            ' ⚠️ TRAMPA VB: `Sub() tocado = True` es una ASIGNACION. En un `Function()` el MISMO texto seria
+            ' una COMPARACION (devolveria un Boolean y descartaria el resultado), el flag nunca se
+            ' prenderia, y todo fallo de volcado se leeria como "no toque el destino". Tiene que ser `Sub()`.
+            Dim tocado As Boolean = False
+            Try
+                ' El callback marca el instante en que el destino ya esta abierto Y truncado: a partir de
+                ' ahi, un fallo dejo el entregable destruido. CONTRATO (ver VolcarEncima): si nunca corrio y
+                ' VolcarEncima tiro, el destino esta byte-identico.
+                EscrituraEnElLugar.VolcarEncima(newPath, archivePath,
+                                                alTocarElDestino:=Sub() tocado = True)
+                ' Y el ENTREGABLE despues, con el MISMO estandar que el pack fresco: este volcado se puede
+                ' cortar a la mitad igual que el de la corrida que murio.
+                VerifyArchive(archivePath, esperadas)
+            Catch ex As Exception
+                If Not tocado Then
+                    ' El destino nunca se abrio: lo tenia un lector en vuelo, o no hubo permiso. El
+                    ' entregable esta como estaba — y "como estaba" puede ser YA VOLCADO, si la corrida
+                    ' muerta murio entre el volcado y la limpieza del par. Se mira el disco para saber cual
+                    ' de los dos es.
+                    ' (El hueco que documenta VolcarEncima —que el SetLength(0) tire y el callback no
+                    ' corra— cae igual acá: este re-verify mira el estado real, no la señal.)
+                    Try
+                        VerifyArchive(archivePath, esperadas)
+                    Catch
+                        Throw New InvalidDataException(
+                            $"no se pudo comprometer '{Path.GetFileName(newPath)}' sobre " &
+                            $"'{Path.GetFileName(archivePath)}': el destino no se pudo abrir (¿un lector en " &
+                            "vuelo?) y lo que hay en disco no verifica. El `.new` y su sello se CONSERVAN " &
+                            "(es la unica copia integra); cerra lo que tenga tomado el archive y re-empaqueta.", ex)
+                    End Try
+                    ' Verifica contra el manifiesto del `.new`: el volcado YA estaba hecho y lo unico que
+                    ' faltaba era limpiar el par. Se limpia abajo y se sigue.
+                Else
+                    ' ⛔ EL PAR SE CONSERVA. El destino se abrio y se trunco, asi que el entregable esta
+                    ' destruido: el `.new` es la unica copia integra del archive nuevo y borrarlo deja al
+                    ' usuario sin nada para volver. No se re-verifica: ya sabemos que esta roto, y un
+                    ' verify de mas solo cambiaria el mensaje.
+                    Throw New InvalidDataException(
+                        $"el volcado de '{Path.GetFileName(newPath)}' sobre " &
+                        $"'{Path.GetFileName(archivePath)}' se corto DESPUES de empezar a escribir: el " &
+                        "entregable quedo a medias. El `.new` y su sello se CONSERVAN (es la unica copia " &
+                        "integra); re-empaqueta para que la recuperacion lo vuelva a intentar.", ex)
+                End If
+            End Try
+
             ' La limpieza no puede tumbar un pack que ya se recupero bien: el `.new` en *delete pending*
             ' por un lector que no cerro hacia tirar a BorrarConReintento y la excepcion salia de aca.
+            ' ⛔ EL SELLO PRIMERO, EL `.new` DESPUES. Es la misma ley del ⛔ de mas arriba aplicada al
+            ' borrado: si la limpieza se corta a la mitad, lo que quede tiene que ser el estado SEGURO.
+            ' Sello→`.new` deja un `.new` huerfano, que la corrida siguiente DESCARTA. Al reves —que es
+            ' como estaba— deja un SELLO huerfano, que empareja con el `.new` de otro ciclo y lo hace pasar
+            ' por verificado sin haberlo verificado nadie.
             Try
-                BorrarConReintento(newPath)
                 BorrarConReintento(selloPath)
+                BorrarConReintento(newPath)
             Catch
             End Try
         End Sub
@@ -669,11 +852,14 @@ Namespace BethesdaArchive.Core
                                           Optional excludePaths As HashSet(Of String) = Nothing)
             EnsureDir(archivePath)
 
-            ' Recuperacion de un volcado cortado: si quedo un `.new`, la corrida anterior murio entre el
-            ' WriteArchive y el volcado, y el archive puede haber quedado a medias. El `.new` es la copia
-            ' integra; si abre como archive valido se lo vuelca, y si no, se descarta. Sin esto, un
-            ' archive truncado hace fallar el ComputeDiff de abajo en cada intento y el mod queda sin
-            ' poder empaquetarse hasta que alguien borre el .ba2 a mano.
+            ' RED DE ATRAS, no el camino principal: la recuperacion de verdad la hace el barrido
+            ' RecuperarVolcadosCortados, que corre en Pack ANTES del censo (ver el ⛔ de alla, que explica
+            ' los tres defectos que salian de recuperar desde aca). Este llamado se queda por el unico
+            ' archive que el barrido no alcanza: con SingleAnchorOnly el barrido se limita al slot 1 —
+            ' porque el flag PROHIBE reescribir los companion numerados— y sin embargo DistributeEntries
+            ' puede caer sobre un slot numerado que YA existe en disco de un experimento previo, con su
+            ' `.new` pendiente. La rutina es idempotente: despues del barrido no encuentra nada y cuesta un
+            ' File.Exists. La LEY sigue viviendo en un solo lugar (la rutina); lo que hay son dos llamadores.
             RecuperarVolcadoCortado(archivePath)
 
             ' Fast path: nothing on disk yet — write fresh. (No existing entries → nothing to exclude.)
@@ -760,9 +946,15 @@ Namespace BethesdaArchive.Core
                 ' La limpieza es cosmetica y va DESPUES, en su propio Try: BorrarConReintento TIRA a los 5
                 ' intentos, y un antivirus escaneando el sello de 0 bytes recien creado convertia un pack
                 ' perfecto en "pack failed".
+                ' ⛔ EL SELLO PRIMERO, EL `.new` DESPUES — el mismo orden que usa RecuperarVolcadoCortado, y
+                ' por la misma razon. Estos son DOS borrados, no uno atomico: el primero puede salir y el
+                ' segundo tirar. Con este orden lo que sobrevive es un `.new` huerfano, que la corrida
+                ' siguiente DESCARTA. Al reves —que es como estaba— lo que sobrevive es un SELLO huerfano,
+                ' que empareja con el `.new` de un ciclo posterior y lo hace pasar por verificado sin que
+                ' nadie lo haya verificado.
                 Try
-                    BorrarConReintento(newPath)
                     BorrarConReintento(newPath & SUFIJO_SELLO)
+                    BorrarConReintento(newPath)
                 Catch
                     ' Un `.new` huerfano lo levanta y lo resuelve la corrida siguiente.
                 End Try
