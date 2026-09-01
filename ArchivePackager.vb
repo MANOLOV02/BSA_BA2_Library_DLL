@@ -593,8 +593,12 @@ Namespace BethesdaArchive.Core
         End Sub
 
         ' --------------------------------------------------------------------------------------
-        ' Per-archive flow: diff vs existing → skip / rewrite. On rewrite, rename current to .bak,
-        ' build the entry list (mixing pass-through + fresh), write, verify. Restore .bak on fail.
+        ' Per-archive flow: diff vs existing → skip / rewrite. On rewrite, build the entry list (mixing
+        ' pass-through + fresh) reading from the CURRENT archive, write it to a sibling `.new`, verify it,
+        ' dump it over the original in place and verify the delivered file. The original is never renamed
+        ' nor deleted: that is what keeps it inside its mod under Mod Organizer and linked under Vortex.
+        ' On failure the `.new` is kept — it is the only intact copy — and the next run picks it up
+        ' (RecuperarVolcadoCortado).
         ' --------------------------------------------------------------------------------------
         ' True when any ExcludePath matches an entry that currently exists in this slot/bucket's archive —
         ' so a delete-only rewrite is needed to strip it. Normalizes the exclude paths the same way archive
@@ -609,6 +613,54 @@ Namespace BethesdaArchive.Core
             Return False
         End Function
 
+        ''' <summary>Levanta el `.new` que haya dejado un volcado cortado. Si abre como archive valido se
+        ''' vuelca sobre el destino (es la version terminada que no llego a comprometerse); si no abre, se
+        ''' descarta. En los dos casos el `.new` se borra: no se acumula.</summary>
+        ''' <summary>Sello que marca que un `.new` PASO su verificacion y por lo tanto se puede volcar a
+        ''' ciegas en la corrida siguiente. Sin el, un `.new` que quedo de un verify FALLIDO se levantaria
+        ''' como si fuera bueno.</summary>
+        Private Const SUFIJO_SELLO As String = ".ok"
+
+        Private Shared Sub RecuperarVolcadoCortado(archivePath As String)
+            Dim newPath = archivePath & ".new"
+            Dim selloPath = newPath & SUFIJO_SELLO
+            ' ⛔ EL SELLO HUERFANO SE LIMPIA PRIMERO. Si sobrevive a la corrida que lo dejo, la siguiente
+            ' puede escribir un `.new` cuyo verify FALLA y juntarlo con este sello viejo: la corrida
+            ' de despues lo tomaria por verificado y volcaria un archive rechazado encima del bueno.
+            If Not File.Exists(newPath) Then
+                If File.Exists(selloPath) Then BorrarConReintento(selloPath)
+                Return
+            End If
+            ' Sin sello, ese `.new` puede ser el de un verify FALLIDO: se descarta, no se vuelca.
+            If Not File.Exists(selloPath) Then
+                BorrarConReintento(newPath)
+                Return
+            End If
+            Try
+                Using fs = New FileStream(newPath, FileMode.Open, FileAccess.Read,
+                                          FileShare.Read Or FileShare.Delete)
+                    Using probe As New BethesdaReader(fs)
+                        If probe.EntriesFiles Is Nothing OrElse probe.EntriesFiles.Count = 0 Then
+                            Throw New InvalidDataException("empty archive")
+                        End If
+                    End Using
+                End Using
+                EscrituraEnElLugar.VolcarEncima(newPath, archivePath)
+            Catch
+                ' No se pudo volcar (destino tomado, sin permisos) o el `.new` no abre: si NO se pudo
+                ' volcar, es la UNICA copia integra del archive nuevo y se CONSERVA — borrarlo dejaba al
+                ' usuario con el archive truncado y sin nada para recuperar.
+                Return
+            End Try
+            ' La limpieza no puede tumbar un pack que ya se recupero bien: el `.new` en *delete pending*
+            ' por un lector que no cerro hacia tirar a BorrarConReintento y la excepcion salia de aca.
+            Try
+                BorrarConReintento(newPath)
+                BorrarConReintento(selloPath)
+            Catch
+            End Try
+        End Sub
+
         Private Shared Sub PackOneArchive(archivePath As String,
                                           bundle As List(Of VirtualEntry),
                                           kind As BucketKind,
@@ -616,6 +668,13 @@ Namespace BethesdaArchive.Core
                                           ba2Version As UInteger,
                                           Optional excludePaths As HashSet(Of String) = Nothing)
             EnsureDir(archivePath)
+
+            ' Recuperacion de un volcado cortado: si quedo un `.new`, la corrida anterior murio entre el
+            ' WriteArchive y el volcado, y el archive puede haber quedado a medias. El `.new` es la copia
+            ' integra; si abre como archive valido se lo vuelca, y si no, se descarta. Sin esto, un
+            ' archive truncado hace fallar el ComputeDiff de abajo en cada intento y el mod queda sin
+            ' poder empaquetarse hasta que alguien borre el .ba2 a mano.
+            RecuperarVolcadoCortado(archivePath)
 
             ' Fast path: nothing on disk yet — write fresh. (No existing entries → nothing to exclude.)
             If Not File.Exists(archivePath) Then
@@ -633,63 +692,83 @@ Namespace BethesdaArchive.Core
                 Return
             End If
 
-            ' Rewrite. Rename current → .bak so we can pass-through unchanged payloads from it,
-            ' and so we have a recovery point if the new write fails.
-            ' ⛔ EL BORRADO DEL .bak VIEJO VA CON REINTENTO. Los lectores de archive abren con
-            ' `FileShare.Delete` (ver FilesDictionary_class.AbrirArchiveParaLectura), que es lo que permite
-            ' que el `File.Move` de abajo funcione con un lector en vuelo. El precio es que, si un handle
-            ' sobrevivio al `File.Delete(bakPath)` del flush ANTERIOR, ese nombre queda en *delete pending*
-            ' hasta que cierre, y un `File.Delete`/`File.Move` sobre el mismo nombre tira ERROR_DELETE_PENDING
-            ' (que .NET reporta como UnauthorizedAccessException, no como IOException). Es el UNICO punto
-            ' expuesto a eso, y dura lo que tarde el ExtractToMemory en curso.
-            Dim bakPath = archivePath & ".bak"
-            BorrarConReintento(bakPath)
-            ' ⛔ EL Move TAMBIEN VA CON REINTENTO. Es el que de verdad se topa con el *delete pending*: el
-            ' nombre destino puede seguir ocupado por un handle que sobrevivio al flush anterior.
-            MoverConReintento(archivePath, bakPath)
+            ' Rewrite. El archive nuevo se arma en un `.new` AL LADO y despues se vuelca ENCIMA del
+            ' original. El original NO se mueve ni se borra en ningun momento.
+            '
+            ' ⛔ NO volver al `MoverConReintento(archivePath, bakPath)` que habia aca. Ese rename dejaba
+            ' el archive definitivo con un nombre NUEVO, y bajo Mod Organizer un nombre nuevo no
+            ' pertenece a ningun mod: el .ba2 terminaba en la carpeta `overwrite` en vez de quedar en el
+            ' mod que lo aporta. En Vortex, ademas, cortaba el hardlink y el mod se quedaba con el
+            ' archive viejo. Volcar encima del original es lo unico que cae adentro del mod en los dos.
+            '
+            ' Lo que se paga, y es deliberado: volcar necesita ABRIR EL ORIGINAL PARA ESCRITURA, y las
+            ' lecturas de archive comparten borrado pero no escritura (AbrirArchiveParaLectura del
+            ' diccionario de archivos). O sea que un lector en vuelo puede negar el volcado, cosa que el
+            ' rename no sufria. Por eso `VolcarEncima` reintenta: los llamadores desmontan el archive
+            ' antes de empaquetar, asi que lo unico que queda vivo es una extraccion en curso, que dura
+            ' lo que tarda. Si aun asi no se puede, esto falla LIMPIO: el original queda intacto y el
+            ' `.new` tambien, y el usuario reintenta el pack.
+            Dim newPath = archivePath & ".new"
+            BorrarConReintento(newPath)
+            ' ⛔ Y el sello TAMBIEN: un ciclo nuevo no puede heredar el sello de otro. Si quedara, este
+            ' `.new` —que todavia no verifico nada— pasaria por verificado ante la corrida siguiente.
+            BorrarConReintento(newPath & SUFIJO_SELLO)
 
             Try
-                ' The .bak reader (and its underlying FileStream) must stay open while WriteArchive
-                ' runs: pass-through VirtualEntries hold PayloadSource references into _fs, and the
-                ' writer streams them directly with no intermediate buffering.
+                ' El reader del ORIGINAL (y su FileStream) tiene que seguir abierto mientras corre
+                ' WriteArchive: las VirtualEntry de pass-through referencian _fs y el writer las
+                ' streamea sin buffer intermedio.
                 Dim entriesToWrite As List(Of VirtualEntry)
                 Dim emptiedByExclusion As Boolean = False
-                Using fs = File.OpenRead(bakPath)
+                Using fs = New FileStream(archivePath, FileMode.Open, FileAccess.Read,
+                                          FileShare.Read Or FileShare.Delete)
                     Using reader As New BethesdaReader(fs)
                         entriesToWrite = BuildEntriesToWrite(bundle, reader, diff, kind)
                         ' Delete-only rewrite that emptied the archive (the excluded entries were its only
-                        ' content): drop the file entirely rather than writing a zero-entry archive. Deferred
-                        ' until after the reader/stream close below so the .bak isn't locked when deleted.
+                        ' content): drop the file entirely rather than writing a zero-entry archive.
                         If entriesToWrite.Count = 0 Then
                             emptiedByExclusion = True
                         Else
-                            WriteArchive(archivePath, entriesToWrite, kind, ba2Version)
+                            WriteArchive(newPath, entriesToWrite, kind, ba2Version)
                         End If
                     End Using
                 End Using
 
                 If emptiedByExclusion Then
-                    If File.Exists(bakPath) Then File.Delete(bakPath)
+                    BorrarConReintento(newPath)
+                    BorrarConReintento(archivePath)
                     result.Skipped.Add(archivePath)
                     Return
                 End If
 
-                ' Verify against the actual write (bundle ∪ preserved), not just the bundle —
-                ' otherwise preserved entries would be counted as "extra" and verification would fail.
+                ' Se verifica el contenido ANTES de comprometerlo. Verify against the actual write
+                ' (bundle ∪ preserved), not just the bundle — otherwise preserved entries would be
+                ' counted as "extra" and verification would fail.
+                VerifyArchive(newPath, entriesToWrite)
+                ' Sello: recien con el verify PASADO el `.new` es una copia que se puede volcar a ciegas.
+                ' Sin esto, un `.new` que quedo de un verify FALLIDO (p. ej. una entrada que extrae vacia)
+                ' lo levantaba la corrida siguiente y lo comprometia encima del archive bueno.
+                File.WriteAllBytes(newPath & SUFIJO_SELLO, Array.Empty(Of Byte)())
+
+                EscrituraEnElLugar.VolcarEncima(newPath, archivePath)
+
+                ' Y el ENTREGABLE despues: el volcado puede cortarse a la mitad.
                 VerifyArchive(archivePath, entriesToWrite)
 
-                File.Delete(bakPath)
+                ' El archive ya esta volcado Y verificado: a partir de aca el pack es un exito.
                 result.Archives.Add(archivePath)
+                ' La limpieza es cosmetica y va DESPUES, en su propio Try: BorrarConReintento TIRA a los 5
+                ' intentos, y un antivirus escaneando el sello de 0 bytes recien creado convertia un pack
+                ' perfecto en "pack failed".
+                Try
+                    BorrarConReintento(newPath)
+                    BorrarConReintento(newPath & SUFIJO_SELLO)
+                Catch
+                    ' Un `.new` huerfano lo levanta y lo resuelve la corrida siguiente.
+                End Try
             Catch
-                ' Rollback: best-effort restore of .bak. Caller sees the original archive intact.
-                Try
-                    If File.Exists(archivePath) Then File.Delete(archivePath)
-                Catch
-                End Try
-                Try
-                    If File.Exists(bakPath) Then File.Move(bakPath, archivePath)
-                Catch
-                End Try
+                ' ⛔ El `.new` NO se borra: si el volcado llego a cortarse, es la unica copia integra del
+                ' archive nuevo. Lo levanta la corrida siguiente (ver el arranque de PackOneArchive).
                 Throw
             End Try
         End Sub
@@ -699,19 +778,6 @@ Namespace BethesdaArchive.Core
         ' size + CRC32. CRC32 of existing entries forces a decompression pass — only paid once
         ' per Pack and only for paths that also appear in the bundle.
         ' --------------------------------------------------------------------------------------
-        ''' <summary>Renombra tolerando *delete pending*, mismo motivo que <see cref="BorrarConReintento"/>.</summary>
-        Private Shared Sub MoverConReintento(origen As String, destino As String)
-            For intento = 1 To 5
-                Try
-                    File.Move(origen, destino)
-                    Return
-                Catch ex As Exception When TypeOf ex Is IOException OrElse TypeOf ex Is UnauthorizedAccessException
-                    If intento = 5 Then Throw
-                    Threading.Thread.Sleep(100)
-                End Try
-            Next
-        End Sub
-
         ''' <summary>Borra un archivo tolerando *delete pending*: si un handle abierto con
         ''' <c>FileShare.Delete</c> todavia no cerro, el nombre sigue existiendo hasta que lo haga y un
         ''' borrado nuevo sobre ese nombre falla con ERROR_DELETE_PENDING (que .NET traduce a
@@ -1319,10 +1385,14 @@ Namespace BethesdaArchive.Core
 
                                 ' Preserve any existing loose file that wasn't ours by renaming it.
                                 ' Caller post-processes "*.bak.unpack" if it cares about conflicts.
+                                ' ⛔ Se COPIA, no se mueve. El `File.Move(outPath, …)` que habia aca sacaba
+                                ' el suelto del arbol virtual de Mod Organizer —o sea, del mod que lo
+                                ' aporta— y entonces el WriteAllBytes de mas abajo escribia un archivo
+                                ' NUEVO, que cae en `overwrite`. Con la copia, el suelto original queda
+                                ' preservado en el `.bak.unpack` y el destino se sobrescribe EN EL LUGAR.
                                 If File.Exists(outPath) Then
                                     Dim conflictBak = outPath & ".bak.unpack"
-                                    If File.Exists(conflictBak) Then File.Delete(conflictBak)
-                                    File.Move(outPath, conflictBak)
+                                    File.Copy(outPath, conflictBak, True)
                                 End If
 
                                 ' ⛔ UN EXTRACT VACIO NO HABILITA EL BORRADO DEL ARCHIVE. `ExtractToMemory`
