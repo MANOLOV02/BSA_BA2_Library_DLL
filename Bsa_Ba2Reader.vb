@@ -887,7 +887,6 @@ Namespace BethesdaArchive.Core
 
             Public Overrides Function Extract(fs As Stream, hdr As Ba2Header) As Byte()
                 Dim isCube As Boolean = ((Flags And 1) <> 0)
-                Dim arraySize As Integer = If(isCube, 6, 1)
                 If Chunks Is Nothing OrElse Chunks.Count = 0 Then
                     Return Array.Empty(Of Byte)()
                 End If
@@ -896,7 +895,12 @@ Namespace BethesdaArchive.Core
                     Throw New NotSupportedException($"BA2.DX10: TileMode={TileMode} no soportado (requiere destileo).")
                 End If
 
-                Dim ddsHeader As Byte() = Loader.EncodeDDSHeader(CInt(DxgiFormatU8), CInt(Width), CInt(Height), arraySize, CInt(If(MipCount = 0, 1, MipCount)), isCube)
+                ' El encode vive en UN solo lugar (Dx10Importer.EncodeDdsHeader) porque lo necesita
+                ' tambien quien extrae al disco una fila ya despojada — ver el docstring de esa funcion.
+                ' `arraySize` sale de isCube, igual que antes: la entrada DX10 del BA2 no tiene campo de
+                ' tamaño de array.
+                Dim ddsHeader As Byte() = Dx10Importer.EncodeDdsHeader(CInt(DxgiFormatU8), CInt(Width), CInt(Height),
+                                                                      CInt(MipCount), isCube)
 
                 ' Los chunks DX10 pueden no venir en orden lógico de mips; ordenamos por MipFirst asc
                 Dim ordered = Chunks.OrderBy(Function(c) CInt(c.MipFirst)).ThenBy(Function(c) CLng(c.Offset)).ToList()

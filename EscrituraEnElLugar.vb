@@ -1,4 +1,5 @@
 ﻿Imports System.IO
+Imports System.Linq
 
 ''' <summary>Escritura de archivos que funciona adentro de los dos gestores de mods.
 ''' <para>LEY: se sobrescribe el destino EN EL LUGAR. No hay temporal, no hay rename y no se borra el
@@ -19,7 +20,25 @@
 ''' a la vez virtualizado por el VFS, respetuoso del hardlink y atomico. La red la pone GuardarConCopia,
 ''' que NO escribe si no pudo dejar antes una copia verificada del contenido que va a pisar.</para>
 ''' <para>ESTA CLASE VA EN EL NAMESPACE RAIZ del proyecto (no en BethesdaArchive.Core): los consumidores
-''' la importan como BSA_BA2_Library_DLL. Moverla de namespace rompe a los siete a la vez.</para></summary>
+''' la importan como BSA_BA2_Library_DLL. Moverla de namespace rompe a los siete a la vez.</para>
+''' <para>⛔⛔ EL CONTRATO PUBLICO DE LAS CUATRO OPERACIONES, Y LO QUE CADA UNA **NO** GARANTIZA. Esta es
+''' la casa de esa tabla: los sitios que la necesiten apuntan acá y no la repiten.</para>
+''' <list type="table">
+''' <item><term>Escribir</term><description>salida REGENERABLE; sin copia; NO garantiza supervivencia a un
+''' corte electrico. Si se pierde, se rehace.</description></item>
+''' <item><term>GuardarConCopia</term><description>UN archivo del usuario; no toca el destino si no
+''' consiguio Y SINCRONIZO un respaldo; restaura ante excepcion manejable; NO es atomico frente a la
+''' terminacion del proceso.</description></item>
+''' <item><term>LoteConCopias</term><description>varios archivos que son UNA unidad; rollback ante
+''' excepcion; diario durable para detectar una terminacion abrupta; la recuperacion la DECIDE el usuario
+''' en el arranque siguiente.</description></item>
+''' <item><term>VolcarEncima</term><description>instala bytes YA preparados sobre el mismo archivo para
+''' conservar la identidad que MO2/Vortex necesitan; el origen tiene que sobrevivir hasta que el destino
+''' este verificado.</description></item></list>
+''' <para>⛔ LA GARANTIA HONESTA, y la frase que NO se usa sin calificar: no existe escritura en el lugar
+''' verdaderamente atomica. Nunca escribir «todo o nada» a secas — se dice <b>«todo o nada ante excepciones
+''' manejadas dentro del proceso»</b>. Ante terminacion abrupta lo que hay es el DIARIO y las copias, que
+''' permiten DETECTAR y ofrecer la recuperacion; no una transaccion que se resuelva sola.</para></summary>
 Public NotInheritable Class EscrituraEnElLugar
 
     Private Sub New()
@@ -85,8 +104,13 @@ Public NotInheritable Class EscrituraEnElLugar
         Dim carpeta = IO.Path.GetDirectoryName(destino)
         If Not String.IsNullOrEmpty(carpeta) Then Directory.CreateDirectory(carpeta)
 
-        ' OpenOrCreate SIN truncar: si el destino esta tomado, es de solo lectura o esta oculto, se falla
-        ' ACA y el archivo queda intacto. (CREATE_ALWAYS sobre un archivo oculto da ACCESS_DENIED.)
+        ' OpenOrCreate SIN truncar. Si el destino esta TOMADO o es de SOLO LECTURA se falla ACA y el
+        ' archivo queda intacto.
+        ' ⛔ SOBRE UN DESTINO OCULTO **NO** SE FALLA: se ESCRIBE, y el atributo se CONSERVA. Esa es la
+        ' razon de ser de esta primitiva y esta medida en el gate (caso M, y el G21 que cita el docstring
+        ' de mas abajo: "destino oculto restaurado byte a byte y todavia oculto"). Este comentario decia lo
+        ' contrario —que el oculto tambien fallaba aca— y contradecia a su propio gate: es CREATE_ALWAYS el
+        ' que da ACCESS_DENIED sobre un archivo oculto, y por eso no se usa CREATE_ALWAYS.
         Using fs As New FileStream(destino, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read)
             seToco = True
             fs.SetLength(0)
@@ -206,12 +230,23 @@ Public NotInheritable Class EscrituraEnElLugar
         ' copia que no tomo esta corrida. (Antes el nombre era el fijo `.prev2` y el `Borrar` previo
         ' destruia la copia de una segunda caida — el mismo daño un nivel mas adentro.)
         Dim heredadas = SlotsOcupados(destino, SufijoCopia)
-        Dim copia = Slot(destino, SufijoCopia, heredadas.Count + 1)
+        ' ⛔ Misma ley que los lotes: el primer HUECO, no el conteo.
+        Dim copia = PrimerSlotLibre(destino, SufijoCopia)
 
-        Dim tieneContenido As Boolean = File.Exists(destino) AndAlso New FileInfo(destino).Length > 0
+        ' ⛔⛔ TODO DESTINO QUE EXISTA SE RESPALDA, 0 BYTES INCLUIDO — y esto ARREGLA UN AGUJERO, no es
+        ' simetria por prolijidad. Acá habia `AndAlso New FileInfo(destino).Length > 0`: con un destino
+        ' EXISTENTE de 0 bytes no se tomaba copia, asi que `copiaHecha` quedaba en False y el `Catch` de mas
+        ' abajo NO restauraba nada — un fallo a mitad del cuerpo dejaba el archivo con BYTES PARCIALES
+        ' donde habia uno vacio, contra el docstring de este mismo metodo, que promete que "si la escritura
+        ' falla DESPUES de haber empezado, restaura el destino solo". No se perdia DATO (no habia), pero la
+        ' promesa era falsa y el estado posterior al fallo no era el anterior.
+        ' Copiar 0 bytes es trivial, el verify por tamaño da 0 = 0, y `MismoContenido` maneja vacios.
+        ' ⚠️ Y NO afloja la ley de las heredadas: con el destino en 0 B la copia sale de 0 B, asi que una
+        ' heredada con contenido NO da `MismoContenido` y sobrevive — que es exactamente lo que G3 exige.
+        Dim existeDestino As Boolean = File.Exists(destino)
         Dim copiaHecha As Boolean = False
         Dim causaCopia As String = ""
-        If tieneContenido Then
+        If existeDestino Then
             Try
                 File.Copy(destino, copia, overwrite:=True)
                 LimpiarAtributos(copia)
@@ -222,9 +257,17 @@ Public NotInheritable Class EscrituraEnElLugar
                 If Not copiaHecha Then
                     Borrar(copia)
                 Else
-                    ' La red solo es red si llego al plato: sin esto, un corte de luz puede llevarse la
-                    ' copia Y el destino, que es justo el estado que toda esta clase existe para evitar.
-                    Sincronizar(copia)
+                    ' ⛔⛔ LA RED SOLO ES RED SI LLEGO AL PLATO, Y AHORA ESO SE EXIGE. `Sincronizar` era
+                    ' best-effort —se tragaba el fallo— y el metodo seguia adelante a TRUNCAR el destino
+                    ' con un respaldo cuya durabilidad nadie pudo confirmar. Es la misma frase que esta
+                    ' clase ya le exige al packer, aplicada a si misma.
+                    Try
+                        SincronizarRespaldo(copia)
+                    Catch exFlush As Exception
+                        Borrar(copia)
+                        copiaHecha = False
+                        causaCopia = "el respaldo no se pudo forzar a disco: " & exFlush.Message
+                    End Try
                 End If
             Catch ex As Exception
                 ' ⛔ LA CAUSA REAL NO SE TIRA A LA BASURA. Acá habia un `Catch` pelado, asi que una
@@ -245,7 +288,7 @@ Public NotInheritable Class EscrituraEnElLugar
                 ' que un inner es una causa que nadie ve. Cuando la copia fallo por tamaño —no hubo
                 ' excepcion, solo no coincidio— no hay causa que agregar y el mensaje queda como estaba.
                 Throw New IOException(
-                    $"'{IO.Path.GetFileName(destino)}' was NOT modified: its backup could not be created" &
+                    $"'{IO.Path.GetFileName(destino)}' was NOT modified: its backup could not be created or flushed to disk" &
                     $" ('{IO.Path.GetFileName(copia)}'). Free up disk space or close whatever is holding " &
                     "that file, then save again." &
                     If(causaCopia = "", "", Environment.NewLine & causaCopia))
@@ -298,13 +341,7 @@ Public NotInheritable Class EscrituraEnElLugar
                 ' sincronizar:=True por el mismo motivo que el resto de este metodo: es el dato del
                 ' usuario volviendo a su lugar.
                 Try
-                    Dim seTocoRestaurando As Boolean = False
-                    Using fsCopia As New FileStream(copia, FileMode.Open, FileAccess.Read, FileShare.Read)
-                        EscribirNucleo(destino,
-                                       Sub(fsDestino) fsCopia.CopyTo(fsDestino),
-                                       seTocoRestaurando,
-                                       sincronizar:=True)
-                    End Using
+                    VolcarEncima(copia, destino, permitirOrigenVacio:=True)
                 Catch
                     Throw New IOException(MensajeCopiaViva(destino, copia), ex)
                 End Try
@@ -340,6 +377,22 @@ Public NotInheritable Class EscrituraEnElLugar
     ''' <summary>Vuelca un archivo ya escrito encima del destino, en el lugar. Lo usan los que no pueden
     ''' escribir directo: el packer (lee el archive viejo mientras produce el nuevo) y el exportador de
     ''' FOMOD (tiene que poder cancelar sin romper el zip anterior).
+    ''' <para>⛔ Y ES TAMBIEN LA PRIMITIVA DE RESTAURACION — el tercer uso, y no es un agregado: restaurar
+    ''' es exactamente esto (tomar un archivo que ya existe y ponerlo encima de otro, en el lugar). Lo
+    ''' consumen <see cref="GuardarConCopia"/> desde su copia y
+    ''' <c>LoadOrderActivator.RestaurarDesdeRespaldo</c> desde su `.npcm.bak`. NO se escribio una funcion
+    ''' `RestaurarDesde` al lado: seria un segundo nombre para el mismo primitivo, y la unica forma de que
+    ''' una restauracion vuelva a quedarse atras de la escritura es que sean dos implementaciones.</para>
+    ''' <para>Lo que la restauracion gana por venir de acá, y que un <c>File.Copy</c> no daba:
+    ''' <list type="bullet">
+    ''' <item>escribe con <c>OpenOrCreate</c>, o sea que <b>funciona sobre un destino OCULTO</b> — la
+    ''' medicion esta en el caso <c>M</c> de <c>Tools\EscrituraEnElLugarGate</c>, y era el defecto: el
+    ''' camino de ida estaba blindado y el de vuelta no;</item>
+    ''' <item>CONSERVA los atributos del destino, asi que restaurar no le cambia el archivo al usuario;</item>
+    ''' <item>se niega a volcar un origen VACIO, o sea que un respaldo de 0 bytes nunca puede pisar el
+    ''' archivo que dice proteger;</item>
+    ''' <item>sincroniza por default, que es lo que corresponde cuando el llamador va a dar por buena la
+    ''' restauracion y borrar el respaldo.</item></list></para>
     ''' <para>Se abre el ORIGEN primero: si no esta, o esta tomado, el destino no se toca. El reintento
     ''' cubre SOLO el fallo de apertura —alguien tiene el archivo abierto y lo suelta en un rato—; si ya
     ''' se empezo a escribir no se reintenta, porque repetir tapa el error real.</para>
@@ -368,11 +421,23 @@ Public NotInheritable Class EscrituraEnElLugar
     ''' (el origen es el suelto del juego) y por lo tanto no necesita la garantia. Costo del flush, medido
     ''' en <see cref="Escribir"/>: +2,66 a +4,53 ms POR LLAMADA — despreciable en un volcado de archive de
     ''' GiB, caro en un lote de cientos de texturas.</para></summary>
+    ''' <param name="permitirOrigenVacio">⛔ SOLO PARA EL CAMINO DE RESTAURACION. Por default un origen de
+    ''' 0 bytes se RECHAZA, y esa ley se queda: para el packer, el exportador de FOMOD y el "move project",
+    ''' un origen vacio significa "lo que iba a instalar esta roto" y volcarlo destruiria el destino bueno.
+    ''' <para>Pero restaurar es al reves: si el archivo del usuario ERA de 0 bytes, su copia es de 0 bytes
+    ''' —y eso esta PROBADO, no supuesto: la copia se verifica comparando longitudes— y devolverlo a 0
+    ''' bytes es exactamente restaurarlo. Con el rechazo puesto, la restauracion TIRABA y el archivo se
+    ''' quedaba con los bytes parciales del intento fallido; lo cazaron L8 y G22 de
+    ''' <c>Tools\EscrituraEnElLugarGate</c>.</para>
+    ''' <para>Va como parametro y no como branch en cada llamador para que la restauracion siga siendo UNA
+    ''' sola llamada: dos ramas "si esta vacio truncar, si no volcar" en dos sitios distintos es como una se
+    ''' queda atras de la otra.</para></param>
     Public Shared Sub VolcarEncima(origen As String, destino As String,
                                    Optional reintentos As Integer = 10,
                                    Optional esperaMs As Integer = 200,
                                    Optional alTocarElDestino As Action = Nothing,
-                                   Optional sincronizar As Boolean = True)
+                                   Optional sincronizar As Boolean = True,
+                                   Optional permitirOrigenVacio As Boolean = False)
         If String.IsNullOrEmpty(origen) Then Throw New ArgumentException("Empty path.", NameOf(origen))
         If String.IsNullOrEmpty(destino) Then Throw New ArgumentException("Empty path.", NameOf(destino))
         If reintentos < 1 Then Throw New ArgumentOutOfRangeException(NameOf(reintentos))
@@ -382,7 +447,7 @@ Public NotInheritable Class EscrituraEnElLugar
             Try
                 Using src As New FileStream(origen, FileMode.Open, FileAccess.Read,
                                             FileShare.Read Or FileShare.Delete)
-                    If src.Length = 0 Then
+                    If src.Length = 0 AndAlso Not permitirOrigenVacio Then
                         Throw New InvalidDataException(
                             $"'{IO.Path.GetFileName(origen)}' is empty: refusing to overwrite " &
                             $"'{IO.Path.GetFileName(destino)}' with nothing.")
@@ -415,6 +480,581 @@ Public NotInheritable Class EscrituraEnElLugar
         Next
     End Sub
 
+    ''' <summary>Escribe por el LOTE si hay lote, y como <see cref="GuardarConCopia"/> si no.
+    ''' <para>⛔ EL `If lote Is Nothing` VIVE ACA Y EN NINGUN OTRO LADO. Los cuatro escritores de la cadena
+    ''' del proyecto (`OSD_Class.Save_As`, `NifContent_Class.Save_As_Manolo_ConCopia`, `SaveHighHeel`,
+    ''' `EscribirTextoUtf8`) mas el `.osp` reciben el lote como parametro OPCIONAL; si cada uno se escribiera
+    ''' su propio despacho serian cinco copias de la misma decision, y la primera que se olvide de
+    ''' actualizarse deja su etapa fuera de la transaccion SIN que nada se ponga rojo.</para>
+    ''' <para>El parametro es opcional a proposito: los llamadores que NO son la cadena del proyecto
+    ''' (el editor de materiales, los sidecars sueltos, el CLI) no cambian de conducta — pasan Nothing por
+    ''' omision y siguen yendo por <see cref="GuardarConCopia"/> exactamente como antes.</para></summary>
+    Public Shared Sub GuardarConCopia(destino As String, cuerpo As Action(Of Stream),
+                                      lote As LoteConCopias)
+        If lote Is Nothing Then
+            GuardarConCopia(destino, cuerpo)
+        Else
+            lote.Guardar(destino, cuerpo)
+        End If
+    End Sub
+
+    ''' <summary>Borra por el LOTE si hay lote, y con un <c>File.Delete</c> best-effort si no.
+    ''' <para>⛔ EL `If lote Is Nothing` VIVE ACA, igual que en el <see cref="GuardarConCopia"/> de tres
+    ''' argumentos: los sitios que borran un sidecar dentro de una cadena de guardado NO deciden cada uno si
+    ''' hay lote, porque la primera copia de esa decision que se olvide de actualizarse deja su borrado
+    ''' fuera de la transaccion SIN que nada se ponga rojo.</para>
+    ''' <para>Sin lote el borrado es best-effort y NO tira: es lo que hacian los `File.Delete` crudos que
+    ''' esto reemplaza, y cambiarlo seria meterle un modo de fallo nuevo a un llamador que no lo pidio. Lo
+    ''' que cambia con lote es que el borrado pasa a tener VUELTA.</para></summary>
+    Public Shared Sub BorrarDelLote(destino As String, lote As LoteConCopias)
+        If String.IsNullOrEmpty(destino) Then Return
+        If lote Is Nothing Then
+            Borrar(destino)
+        Else
+            lote.Eliminar(destino)
+        End If
+    End Sub
+
+    ''' <summary>Margen sobre el tamaño de los respaldos: 64 MiB. Cubre el diario, el crecimiento de los
+    ''' archivos que se están por escribir y la metadata del sistema de archivos.
+    ''' <para>⛔ CONSTANTE NOMBRADA Y UNA SOLA VEZ. Un 64 repetido en cada llamador es un número que nadie
+    ''' puede cambiar sin cazarlos a todos.</para></summary>
+    Public Const MargenDeEspacioParaRespaldos As Long = 64L * 1024L * 1024L
+
+    ''' <summary>Aborta ANTES de que el lote cree su primera copia si el espacio libre no alcanza.
+    ''' <para>⛔ POR QUE ANTES Y NO DURANTE. El pico de un lote sano es «los destinos actuales + sus copias»,
+    ''' y quedarse sin espacio a mitad es el peor momento posible: ya hay etapas escritas, el rollback
+    ''' necesita escribir para devolverlas, y escribir es justo lo que no se puede. Fallar antes de tocar
+    ''' nada deja el disco exactamente como estaba.</para>
+    ''' <para><paramref name="libre"/> se pasa por parámetro a propósito: es lo que hace la ley MEDIBLE. Un
+    ''' gate no puede llenar el disco real, pero sí puede inyectar el número y verificar el umbral. El
+    ''' llamador de producción usa la sobrecarga de abajo, que lo resuelve con <c>DriveInfo</c>.</para>
+    ''' <para>Sólo se suman los destinos que EXISTEN: de los que no existen no se toma copia (son
+    ''' creaciones), así que no ocupan espacio de respaldo.</para></summary>
+    Public Shared Sub ExigirEspacioParaLote(destinos As IEnumerable(Of String), libre As Long)
+        If destinos Is Nothing Then Return
+        Dim requerido As Long = 0
+        For Each d In destinos
+            If String.IsNullOrEmpty(d) Then Continue For
+            Try
+                If File.Exists(d) Then requerido += New FileInfo(d).Length
+            Catch
+                ' Un destino que no se puede medir no bloquea el guardado: el que decide es el espacio.
+            End Try
+        Next
+        If libre < requerido + MargenDeEspacioParaRespaldos Then
+            Throw New IOException(
+                "Not enough free space for a protected save. Required backup space: " &
+                $"{requerido:N0} bytes plus a {MargenDeEspacioParaRespaldos:N0} byte margin; available: " &
+                $"{libre:N0} bytes. Free up space and save again.")
+        End If
+    End Sub
+
+    ''' <summary>Igual, resolviendo el espacio libre del volumen donde viven los destinos.
+    ''' <para>Si no se puede consultar el volumen, NO se bloquea el guardado: un chequeo preventivo que no
+    ''' se pudo hacer no es motivo para negarle al usuario su guardado — el camino de fallo real sigue
+    ''' cubierto por «sin red no se trunca».</para></summary>
+    Public Shared Sub ExigirEspacioParaLote(destinos As IEnumerable(Of String))
+        If destinos Is Nothing Then Return
+        Dim primero = destinos.FirstOrDefault(Function(d) Not String.IsNullOrEmpty(d))
+        If primero Is Nothing Then Return
+        Dim libre As Long
+        Try
+            Dim raiz = IO.Path.GetPathRoot(IO.Path.GetFullPath(primero))
+            If String.IsNullOrEmpty(raiz) Then Return
+            libre = New DriveInfo(raiz).AvailableFreeSpace
+        Catch
+            Return
+        End Try
+        ExigirEspacioParaLote(destinos, libre)
+    End Sub
+
+    ''' <summary>Dónde viven los diarios de lote. ⛔ SIN SETEAR ⇒ LOS LOTES NO ESCRIBEN DIARIO, que es
+    ''' EXACTAMENTE la conducta anterior. Cada app la setea al arrancar (p. ej.
+    ''' <c>LocalApplicationData\&lt;app&gt;\diarios</c>); los arneses que no la setean no cambian de
+    ''' comportamiento ni ensucian el disco del usuario con diarios de prueba.
+    ''' <para>No va bajo <c>Data</c>: es metadata de la aplicación, y ponerla al lado de los archivos del
+    ''' mod la metería bajo el VFS de MO2.</para></summary>
+    Public Shared Property CarpetaDeDiarios As String = ""
+
+    ''' <summary>Los diarios que quedaron de una corrida que NO terminó su lote. Es la API del arranque:
+    ''' la app los enumera, MUESTRA los destinos y sus copias, y le ofrece al usuario
+    ''' <i>Restaurar estado anterior</i> o <i>Conservar estado actual</i>.
+    ''' <para>⛔ NO RESTAURA NADA. Después de un reinicio no hay forma de saber si el usuario quiere volver
+    ''' atrás o quedarse con lo nuevo; decidir por él sería pisarle el trabajo. Y el diario se borra SÓLO
+    ''' después de completar y verificar la decisión.</para>
+    ''' <para>Un diario ilegible no se cuenta: no se puede describir una transacción que no se pudo
+    ''' leer.</para></summary>
+    Public Shared Function DiariosPendientes() As List(Of DiarioDeEscritura)
+        Dim out As New List(Of DiarioDeEscritura)
+        If String.IsNullOrEmpty(CarpetaDeDiarios) OrElse Not Directory.Exists(CarpetaDeDiarios) Then Return out
+        For Each f In Directory.EnumerateFiles(CarpetaDeDiarios, "*" & DiarioDeEscritura.SufijoDiario)
+            Dim d = DiarioDeEscritura.Leer(f)
+            If d IsNot Nothing Then out.Add(d)
+        Next
+        Return out
+    End Function
+
+    ''' <summary>Abre un LOTE: varios archivos que forman UNA sola unidad para el usuario (el proyecto de
+    ''' Wardrobe Manager son cinco: `.osd`, `.nif`, `.hht`, el `.xml` de SMP y el `.osp`).
+    ''' <para>⛔ EL DEFECTO QUE CIERRA. <see cref="GuardarConCopia"/> es transaccional POR ARCHIVO y borra
+    ''' su copia al salir bien. Encadenando cinco, un fallo en la etapa 3 deja las etapas 1 y 2 escritas y
+    ''' SIN copia: el proyecto queda mezclando archivos nuevos y viejos —un `.osp` apuntando a un `.osd`
+    ''' nuevo con un `.nif` viejo— y no hay nada para volver. No es hipotetico: el docstring de
+    ''' <c>OSP_Clases.Save_Shapedatas</c> ya documenta una instancia anterior de este mismo daño
+    ''' (<i>"se escribia el .osd, se re-apuntaba el .osp, se escribia el .nif y recien ahi SaveHighHeel
+    ''' reventaba — proyecto a medio escribir"</i>). Lo que se arreglo entonces fue preguntar el overwrite
+    ''' UNA sola vez; su promesa «o se escribe TODO o no se toca NADA» es cierta para esa pregunta y FALSA
+    ''' para un fallo de I/O.</para>
+    ''' <para>Lo unico que cambia respecto de encadenar <see cref="GuardarConCopia"/> es CUANDO se borran
+    ''' las copias: no al exito individual, sino al de <see cref="LoteConCopias.Confirmar"/>. No hay copias
+    ''' de mas, no hay temporales y no hay rename — la ley MO2/Vortex no se toca.</para>
+    ''' <para>⚠️ LO QUE NO DA, dicho en vez de escondido: NO es atomico. Cubre la EXCEPCION, no el corte de
+    ''' luz. Si el proceso muere entre dos etapas, el lote queda a medias y las copias quedan en disco —que
+    ''' ya es mejor que hoy, donde no quedarian— pero nadie las restaura solo. Lo que cierra ese hueco es
+    ''' <see cref="CopiasPendientes"/>, que las NOMBRA cuando el usuario vuelve a abrir el proyecto.
+    ''' ⛔ Un protocolo tipo `.new`+sello (el del packer) daria recuperacion automatica y queda declarado
+    ''' como upgrade POSIBLE y NO implementado: no lo paga un evento raro cuando las copias ya sobreviven y
+    ''' quedan nombradas, y los bytes los decide el usuario.</para></summary>
+    Public Shared Function NuevoLote() As LoteConCopias
+        Return New LoteConCopias()
+    End Function
+
+    ''' <summary>Las copias de lote que quedaron en disco para <paramref name="rutas"/> — o sea: los
+    ''' archivos que un guardado anterior alcanzo a respaldar y nunca confirmo.
+    ''' <para>⛔ ES UN DETECTOR, NO UNA RECUPERACION. Devuelve nombres para que el llamador los MUESTRE
+    ''' ("un guardado anterior quedo a medias; estas son las versiones previas"). NO restaura, NO borra y
+    ''' NO decide: los bytes del usuario los decide el usuario. Es la contraparte barata del hueco que
+    ''' <see cref="NuevoLote"/> declara — un corte de luz entre etapas deja el lote a medias, y sin esto el
+    ''' usuario tiene copias al lado de sus archivos sin saber que son ni de cuando.</para></summary>
+    Public Shared Function CopiasPendientes(rutas As IEnumerable(Of String)) As List(Of String)
+        Dim out As New List(Of String)
+        If rutas Is Nothing Then Return out
+        For Each r In rutas
+            If String.IsNullOrEmpty(r) Then Continue For
+            out.AddRange(SlotsOcupados(r, SufijoCopia))
+        Next
+        Return out
+    End Function
+
+    ''' <summary>El scope del lote. Ver <see cref="NuevoLote"/> para el por que.</summary>
+    Public NotInheritable Class LoteConCopias
+        Implements IDisposable
+
+        ''' <summary>Una etapa del lote. ⛔ SON TRES OPERACIONES, NO UNA — y esa fue la falla de clase de la
+        ''' primera version: la ley modelaba solo REEMPLAZAR un archivo con contenido, asi que CREAR y
+        ''' BORRAR quedaban fuera del rollback. Deshacer una creacion es BORRAR el archivo, y deshacer un
+        ''' borrado es RECREARLO — ninguna de las dos es "volcar una copia encima".
+        ''' <list type="bullet">
+        ''' <item><b>reemplazo</b>: <c>Copia</c> lleno, <c>EsBorrado</c>=False ⇒ deshacer VUELCA la copia;</item>
+        ''' <item><b>creacion</b>: <c>Copia</c> vacio ⇒ el destino NO existia ⇒ deshacer lo BORRA;</item>
+        ''' <item><b>borrado</b>: <c>EsBorrado</c>=True ⇒ deshacer vuelca la copia Y reaplica
+        ''' <c>Atributos</c>.</item></list>
+        ''' <para>⛔ <c>Copia = ""</c> SIGNIFICA "creacion" Y NADA MAS, y eso vale porque el guard de
+        ''' <c>Length &gt; 0</c> se saco: hoy se respalda TODO destino que exista, 0 bytes incluido. Con el
+        ''' guard puesto, un destino vacio tambien daba <c>Copia = ""</c> y el deshacer lo habria BORRADO
+        ''' creyendolo una creacion — el bug que el propio fix habria introducido.</para>
+        ''' <para><c>Atributos</c> hace falta porque el respaldo pasa por <see cref="LimpiarAtributos"/> (si
+        ''' no, la copia de un archivo OCULTO queda invisible y una de SOLO LECTURA no se puede borrar). Al
+        ''' recrear hay que devolverle al archivo los suyos, no los de la copia.</para></summary>
+        Private NotInheritable Class Etapa
+            Public Property Destino As String
+            Public Property Copia As String          ' "" ⟺ el destino NO existia ⟺ la etapa fue una CREACION
+            Public Property Heredadas As List(Of String)
+            Public Property EsBorrado As Boolean
+            Public Property Atributos As FileAttributes
+        End Class
+
+        Private ReadOnly _etapas As New List(Of Etapa)
+        ' Nothing cuando `CarpetaDeDiarios` no esta seteada: lote sin diario = conducta anterior.
+        Private ReadOnly _diario As DiarioDeEscritura = AbrirDiario()
+
+        Private Shared Function AbrirDiario() As DiarioDeEscritura
+            If String.IsNullOrEmpty(CarpetaDeDiarios) Then Return Nothing
+            Try
+                Return New DiarioDeEscritura(CarpetaDeDiarios)
+            Catch
+                ' Un diario que no se pudo abrir NO bloquea el guardado: se pierde la deteccion de un
+                ' corte, no el dato del usuario. El rollback en proceso sigue funcionando igual.
+                Return Nothing
+            End Try
+        End Function
+        Private _confirmado As Boolean = False
+        Private _dispuesto As Boolean = False
+
+        ''' <summary>Qué pasó con la restauración del lote. Cadena vacia = todo volvio (o no hizo falta).
+        ''' Se llena cuando el lote se deshace; el llamador la puede mostrar.</summary>
+        Public ReadOnly Property InformeDeRestauracion As String = ""
+
+        ''' <summary>Escribe un archivo del lote. Identico a <see cref="GuardarConCopia"/> —copia
+        ''' verificada al primer slot LIBRE, sincronizada, y sin red no se trunca— MENOS el borrado de la
+        ''' copia, que se difiere a <see cref="Confirmar"/>.
+        ''' <para>⛔ SI ESTA ESCRITURA FALLA, SE DESHACE EL LOTE ENTERO ACA MISMO y se tira UNA excepcion
+        ''' que lleva la causa original Y el estado archivo por archivo. Deshacer desde el `Dispose` no
+        ''' alcanzaria: una excepcion tirada durante el desenrollado TAPA la original, y el usuario perderia
+        ''' justamente el motivo.</para></summary>
+        Public Sub Guardar(destino As String, cuerpo As Action(Of Stream))
+            If _confirmado Then Throw New InvalidOperationException("El lote ya fue confirmado.")
+            If String.IsNullOrEmpty(destino) Then Throw New ArgumentException("Empty path.", NameOf(destino))
+            If cuerpo Is Nothing Then Throw New ArgumentNullException(NameOf(cuerpo))
+
+            Dim heredadas = SlotsOcupados(destino, SufijoCopia)
+            ' ⛔ `PrimerSlotLibre` y NO `Slot(..., Count + 1)`: con la enumeracion que ve huecos,
+            ' contar devuelve un nombre YA OCUPADO (ver el ⛔ de PrimerSlotLibre). Los dos cambios
+            ' son atomicos.
+            Dim copia = PrimerSlotLibre(destino, SufijoCopia)
+            ' ⛔⛔ SE RESPALDA TODO DESTINO QUE EXISTA, 0 BYTES INCLUIDO. Acá habia
+            ' `AndAlso New FileInfo(destino).Length > 0`, y ese guard rompia el invariante del que depende
+            ' TODO el rollback: con el, un destino EXISTENTE PERO VACIO tambien salia con `Copia = ""`, o
+            ' sea indistinguible de una CREACION — y deshacer lo habria BORRADO. Sacandolo,
+            ' `Copia = ""` ⟺ el destino no existia, que es lo que Etapa documenta.
+            ' Y ademas cierra un agujero por si mismo: con el guard, un fallo a mitad de escritura sobre un
+            ' destino de 0 bytes dejaba BYTES PARCIALES y no habia copia para volver, contra un docstring
+            ' que promete "restaura el destino solo". Copiar 0 bytes es trivial y `MismoContenido` maneja
+            ' vacios (dos archivos de largo 0 dan iguales en la primera lectura).
+            Dim existeDestino As Boolean = File.Exists(destino)
+            Dim copiaHecha As Boolean = False
+            Dim causaCopia As String = ""
+
+            If existeDestino Then
+                Try
+                    File.Copy(destino, copia, overwrite:=True)
+                    LimpiarAtributos(copia)
+                    copiaHecha = (New FileInfo(copia).Length = New FileInfo(destino).Length)
+                    ' ⛔ Flush OBLIGATORIO del respaldo; el fallo va por DeshacerYTirar (hay etapas
+                    ' previas del lote que deshacer), no por un Throw crudo.
+                    If Not copiaHecha Then
+                        Borrar(copia)
+                    Else
+                    Try
+                        SincronizarRespaldo(copia)
+                    Catch exFlush As Exception
+                        Borrar(copia)
+                        copiaHecha = False
+                        causaCopia = "el respaldo no se pudo forzar a disco: " & exFlush.Message
+                    End Try
+                    End If
+                Catch ex As Exception
+                    copiaHecha = False
+                    causaCopia = ex.Message
+                    Borrar(copia)
+                End Try
+                ' SIN RED NO SE TRUNCA — y acá ademas no se toco nada todavia de ESTA etapa, asi que el
+                ' lote se deshace limpio.
+                If Not copiaHecha Then
+                    DeshacerYTirar($"'{IO.Path.GetFileName(destino)}' was NOT modified: its backup could not " &
+                                   $"be created ('{IO.Path.GetFileName(copia)}')." &
+                                   If(causaCopia = "", "", Environment.NewLine & causaCopia), Nothing)
+                End If
+            End If
+
+            ' ⛔ EL DIARIO SE ESCRIBE ACA: la copia ya esta asegurada y sincronizada, y el destino
+            ' todavia NO se toco. Al reves el diario describiria algo que no paso, o el destino
+            ' cambiaria sin que nadie lo hubiera anotado. Para una CREACION se registra antes de crear.
+            Dim existia = File.Exists(destino)
+            If _diario IsNot Nothing Then
+                _diario.Registrar(destino, If(copiaHecha, copia, ""),
+                                  If(existia, "reemplazar", "crear"), FileAttributes.Normal)
+            End If
+            Dim seToco As Boolean = False
+            Try
+                EscribirNucleo(destino, cuerpo, seToco, sincronizar:=True)
+            Catch ex As ContratoDelCuerpoException
+                ' ⛔⛔ ACA EL LOTE DIVERGE DE LA LEY DE UN SOLO ARCHIVO, A PROPOSITO. Este comentario decia
+                ' "misma ley que `Escribir`: el archivo se conserva", y desde que existe el rollback de
+                ' creaciones eso es FALSO: la etapa se registra y `DeshacerYTirar` la deshace como a
+                ' cualquier otra — con copia le vuelca la version vieja encima, y si fue una CREACION la
+                ' BORRA.
+                '
+                ' La divergencia es la correcta y por eso se declara en vez de disimularla:
+                '   · en `Escribir`/`GuardarConCopia` (ver el ⛔ de ContratoDelCuerpoException) el archivo se
+                '     CONSERVA, porque es la unidad entera: sus bytes son los que el cuerpo produjo y no hay
+                '     nada mas con que quedar consistente;
+                '   · en un LOTE la unidad son N archivos y manda todo-o-nada ANTE EXCEPCIONES MANEJADAS
+                '     DENTRO DEL PROCESO (ver el contrato en la cabecera). Conservar el del violador del
+                '     contrato mientras sus hermanos se deshacen deja EXACTAMENTE el estado mezclado que el
+                '     lote existe para impedir — y encima uno cuya durabilidad no podemos sostener.
+                ' Lo que NO cambia es el aviso: se sigue tirando con el mensaje del contrato, asi que el
+                ' llamador se entera de que lo que rompio fue el `leaveOpen`, no un fallo de disco.
+                _etapas.Add(New Etapa With {.Destino = destino, .Copia = If(copiaHecha, copia, ""), .Heredadas = heredadas})
+                DeshacerYTirar(ex.Message, ex)
+            Catch ex As Exception
+                If seToco AndAlso Not existia Then Borrar(destino)
+                If copiaHecha Then
+                    ' Esta etapa vuelve primero, con la misma primitiva a prueba de ocultos que el resto.
+                    Try
+                        VolcarEncima(copia, destino, permitirOrigenVacio:=True)
+                        Borrar(copia)
+                        copiaHecha = False
+                    Catch
+                        ' No volvio: su copia se QUEDA. Se anota como etapa para que el informe la nombre.
+                        _etapas.Add(New Etapa With {.Destino = destino, .Copia = copia, .Heredadas = heredadas})
+                        DeshacerYTirar(MensajeCopiaViva(destino, copia), ex)
+                    End Try
+                End If
+                DeshacerYTirar(ex.Message, ex)
+            End Try
+
+            _etapas.Add(New Etapa With {.Destino = destino, .Copia = If(copiaHecha, copia, ""), .Heredadas = heredadas})
+        End Sub
+
+        ''' <summary>BORRA un archivo COMO ETAPA DEL LOTE. Es la tercera operacion destructiva, y hasta acá
+        ''' la ley no la tenia: los sitios que borraban un sidecar en medio de un guardado lo hacian con un
+        ''' <c>File.Delete</c> crudo, o sea SIN VUELTA — si una etapa posterior fallaba, el lote devolvia los
+        ''' archivos que habia reemplazado y el borrado quedaba hecho igual.
+        ''' <para>Inexistente ⇒ no-op (no hay nada que borrar ni que restaurar). Existente ⇒ copia VERIFICADA
+        ''' al primer slot LIBRE —la misma ley de slots que <see cref="GuardarConCopia"/>, asi que un
+        ''' respaldo que ya estaba no se pisa nunca—, se anotan sus atributos, y RECIEN AHI se borra.</para>
+        ''' <para>⛔ SIN RED NO SE BORRA, exactamente como "sin red no se trunca": si no se pudo dejar la
+        ''' copia, el archivo NO se toca y el lote se deshace. Un borrado sin respaldo es la unica operacion
+        ''' de las tres que no se puede deshacer NUNCA.</para>
+        ''' <para><see cref="Confirmar"/> se lleva la copia; deshacer recrea el archivo con sus bytes Y sus
+        ''' atributos (ver <c>Deshacer</c>).</para></summary>
+        Public Sub Eliminar(destino As String)
+            If _confirmado Then Throw New InvalidOperationException("El lote ya fue confirmado.")
+            If String.IsNullOrEmpty(destino) Then Throw New ArgumentException("Empty path.", NameOf(destino))
+            If Not File.Exists(destino) Then Return          ' no-op: no hay nada que borrar
+
+            Dim heredadas = SlotsOcupados(destino, SufijoCopia)
+            ' ⛔ `PrimerSlotLibre` y NO `Slot(..., Count + 1)`: con la enumeracion que ve huecos,
+            ' contar devuelve un nombre YA OCUPADO (ver el ⛔ de PrimerSlotLibre). Los dos cambios
+            ' son atomicos.
+            Dim copia = PrimerSlotLibre(destino, SufijoCopia)
+            ' ⛔ SE REGISTRA SI LA LECTURA SALIO BIEN, no solo el valor. Si `GetAttributes` fallara, la
+            ' variable se queda en `Normal` — que NO son "los atributos originales" sino un default. Volver
+            ' a poner ese default seria ALTERAR el archivo por segunda vez, creyendo que se lo restaura.
+            Dim atributos As FileAttributes = FileAttributes.Normal
+            Dim atributosLeidos As Boolean = False
+            Try
+                atributos = File.GetAttributes(destino)
+                atributosLeidos = True
+            Catch
+            End Try
+
+            Dim copiaHecha As Boolean = False
+            Dim causaCopia As String = ""
+            Try
+                File.Copy(destino, copia, overwrite:=True)
+                LimpiarAtributos(copia)
+                copiaHecha = (New FileInfo(copia).Length = New FileInfo(destino).Length)
+                ' ⛔ Flush OBLIGATORIO ANTES de tocar atributos o borrar el destino.
+                If Not copiaHecha Then
+                    Borrar(copia)
+                Else
+                Try
+                    SincronizarRespaldo(copia)
+                Catch exFlush As Exception
+                    Borrar(copia)
+                    copiaHecha = False
+                    causaCopia = "el respaldo no se pudo forzar a disco: " & exFlush.Message
+                End Try
+                End If
+            Catch ex As Exception
+                copiaHecha = False
+                causaCopia = ex.Message
+                Borrar(copia)
+            End Try
+            If Not copiaHecha Then
+                DeshacerYTirar($"'{IO.Path.GetFileName(destino)}' was NOT deleted: its backup could not be created or flushed to disk " &
+                               $"created ('{IO.Path.GetFileName(copia)}')." &
+                               If(causaCopia = "", "", Environment.NewLine & causaCopia), Nothing)
+            End If
+
+            ' ⛔ El borrado se anota ANTES de hacerlo, con su copia y sus atributos: si el proceso muere
+            ' entre el Delete y el registro, el arranque siguiente no sabria que ese archivo existia.
+            If _diario IsNot Nothing Then _diario.Registrar(destino, copia, "borrar", atributos)
+            Try
+                ' Un SOLO LECTURA no se deja borrar; los atributos originales ya quedaron anotados arriba.
+                LimpiarAtributos(destino)
+                File.Delete(destino)
+            Catch ex As Exception
+                ' ⛔⛔ SI EL BORRADO FALLA, EL ARCHIVO SE QUEDA — Y TIENE QUE QUEDARSE COMO ESTABA. El
+                ' `LimpiarAtributos` de arriba ya le saco el OCULTO / SOLO LECTURA al archivo del USUARIO
+                ' para poder borrarlo; si el `Delete` no pudo (archivo tomado, que es el caso normal), sin
+                ' esto el archivo sobrevivia ALTERADO y el mensaje decia solamente "could not be deleted",
+                ' sin admitir que ademas le habia cambiado los atributos. Un oculto que reaparece a la vista
+                ' del usuario en una carpeta que MO2 le presenta no es un detalle cosmetico.
+                ' Va PRIMERO, antes de tocar la copia y antes de deshacer, y con su Try propio que traga: la
+                ' restauracion no puede pisar la causa original — es la misma ley que el `Dispose` que nunca
+                ' tira. Cubre tambien el caso en que lo que tiro fue el propio `LimpiarAtributos`: reponer
+                ' el mismo valor es un no-op.
+                Dim atributosDevueltos As Boolean = Not atributosLeidos    ' nada que devolver = nada que fallar
+                If atributosLeidos Then
+                    Try
+                        File.SetAttributes(destino, atributos)
+                        atributosDevueltos = True
+                    Catch
+                    End Try
+                End If
+
+                Borrar(copia)          ' el archivo sigue ahi: su copia no aporta nada y no se deja colgada
+                ' ⛔ EL MENSAJE DICE LA VERDAD DE LAS DOS COSAS. Si los atributos volvieron, el texto de
+                ' siempre es cierto y alcanza. Si NO volvieron, el usuario tiene que enterarse de que su
+                ' archivo quedo distinto de como estaba, y de cual era el valor.
+                DeshacerYTirar($"'{IO.Path.GetFileName(destino)}' could not be deleted." &
+                               If(atributosDevueltos, "",
+                                  $" It was also left WITHOUT its original attributes (it had: {atributos}).") &
+                               Environment.NewLine & ex.Message, ex)
+            End Try
+
+            _etapas.Add(New Etapa With {.Destino = destino, .Copia = copia, .Heredadas = heredadas,
+                                        .EsBorrado = True, .Atributos = atributos})
+        End Sub
+
+        ''' <summary>El lote salio bien: recien ACA se borran las copias que tomo esta corrida, y se aplica
+        ''' la ley de heredadas de <see cref="GuardarConCopia"/> — una heredada se borra SOLO si esta
+        ''' corrida la PROBO byte por byte redundante.</summary>
+        Public Sub Confirmar()
+            If _confirmado Then Return
+            For Each e In _etapas
+                If e.Copia = "" Then Continue For
+                Dim redundantes As New List(Of String)
+                For Each h In e.Heredadas
+                    If MismoContenido(h, e.Copia) Then redundantes.Add(h)
+                Next
+                Borrar(e.Copia)
+                For Each h In redundantes
+                    Borrar(h)
+                Next
+            Next
+            ' ⛔ EL DIARIO SE CIERRA AL FINAL, despues de borrar las copias: si el proceso muere entre
+            ' medio, lo que sobrevive es un diario que ofrece recuperar un lote YA escrito —molesto—
+            ' en vez de copias sin diario que nadie sabe de donde salieron.
+            If _diario IsNot Nothing Then _diario.Cerrar()
+            _confirmado = True
+        End Sub
+
+        ''' <summary>⛔ NUNCA TIRA. Si el lote no se confirmo, deshace lo escrito en orden INVERSO y deja el
+        ''' informe en <see cref="InformeDeRestauracion"/>. Tirar desde acá taparia la excepcion que venia
+        ''' propagando —que es la causa que el usuario necesita—, asi que el camino que SI tira es el
+        ''' `Guardar` fallido. Este cubre el otro caso: que el llamador aborte por su cuenta entre
+        ''' etapas.</summary>
+        Public Sub Dispose() Implements IDisposable.Dispose
+            If _dispuesto Then Return
+            _dispuesto = True
+            If _confirmado Then Return
+            _InformeDeRestauracion = Deshacer()
+            ' ⛔ EL DIARIO SE VA SOLO SI TODO VOLVIO. Un informe vacio significa que el rollback EN
+            ' PROCESO dejo el disco como estaba: conservar el diario ofreceria en el arranque siguiente
+            ' 'recuperar' un estado que ya esta recuperado, y el usuario no tiene como saber que no hay
+            ' nada que hacer. Si hubo CAIDOS —o advertencias— el diario SE QUEDA: ahi si hay algo
+            ' pendiente que el arranque tiene que ofrecer.
+            If _diario IsNot Nothing AndAlso _InformeDeRestauracion = "" Then _diario.Cerrar()
+        End Sub
+
+        ''' <summary>Restaura en orden INVERSO. ⛔ SE INTENTAN TODAS: no se corta en la primera que falla,
+        ''' porque cortar deja restauradas justo las ultimas y sin tocar las primeras — el estado mezclado
+        ''' que este lote existe para evitar. ⛔ Y LA COPIA DE UN ARCHIVO QUE NO VOLVIO NO SE BORRA JAMAS:
+        ''' es su unico ejemplar.</summary>
+        Private Function Deshacer() As String
+            Dim vueltos As New List(Of String)
+            Dim caidos As New List(Of String)
+            ' ⛔ TERCERA LISTA, y no es cosmetica: una advertencia metida en `vueltos` MORIA en el
+            ' epilogo, porque con `caidos.Count = 0` se devolvia "" y el informe entero desaparecia. O sea
+            ' que el aviso "volvio SIN sus atributos" solo se veia si ADEMAS algo no habia vuelto — justo
+            ' al reves de lo que hace falta. Los tres estados son distintos y se reportan por separado:
+            ' volvio / volvio incompleto / no volvio.
+            Dim advertencias As New List(Of String)
+            For i = _etapas.Count - 1 To 0 Step -1
+                Dim e = _etapas(i)
+
+                ' ⛔ CREACION: el destino NO existia, asi que deshacerla es BORRARLO. Acá se hacia
+                ' `Continue For` —"no hay copia, no hay nada que restaurar"—, y eso dejaba EN DISCO todos
+                ' los archivos que el lote habia creado: un proyecto NUEVO que falla en la etapa 3 dejaba el
+                ' `.osd` y el `.nif` huerfanos, sin `.osp` que los nombre. Restaurar una creacion no es
+                ' volcar nada: es que el archivo no este.
+                If e.Copia = "" AndAlso Not e.EsBorrado Then
+                    If File.Exists(e.Destino) Then
+                        Try
+                            LimpiarAtributos(e.Destino)   ' un SOLO LECTURA no se deja borrar
+                            File.Delete(e.Destino)
+                            vueltos.Add(IO.Path.GetFileName(e.Destino) & " (creado, se quita)")
+                        Catch
+                            caidos.Add($"  · '{IO.Path.GetFileName(e.Destino)}' se creo en este guardado y " &
+                                       "NO se pudo quitar; borralo a mano si no lo querias")
+                        End Try
+                    End If
+                    Continue For
+                End If
+
+                ' ⛔ UNA COPIA REGISTRADA QUE YA NO ESTA NO SE SALTEA EN SILENCIO. Acá habia un
+                ' `Continue For` a secas: si el respaldo se esfumaba entre que se tomo y el deshacer (lo
+                ' borro un limpiador, un antivirus, el usuario), la etapa DESAPARECIA del informe — el
+                ' archivo NO habia vuelto y nadie lo nombraba. Es la misma clase de defecto que el `Catch`
+                ' mudo: el peor resultado no es fallar, es fallar sin que se note.
+                ' (La etapa de CREACION no llega hasta acá: la resuelve la rama de arriba, que no necesita
+                ' copia porque deshacerla es borrar.)
+                If Not File.Exists(e.Copia) Then
+                    caidos.Add($"  · '{IO.Path.GetFileName(e.Destino)}' NO se pudo devolver: su respaldo " &
+                               $"'{IO.Path.GetFileName(e.Copia)}' ya no esta en disco")
+                    Continue For
+                End If
+                Try
+                    VolcarEncima(e.Copia, e.Destino, permitirOrigenVacio:=True)
+                    ' ⛔ BORRADO: el archivo se habia ido, asi que recrearlo NO alcanza con los bytes — hay
+                    ' que devolverle SUS atributos. El respaldo paso por `LimpiarAtributos` (si no, la copia
+                    ' de un OCULTO queda invisible y una de SOLO LECTURA no se puede borrar despues), asi
+                    ' que los originales viajan en la Etapa y se reaplican acá.
+                    ' ⛔ Y SI LA DEVOLUCION DE ATRIBUTOS FALLA, SE DICE. Este `Catch` estaba vacio y despues
+                    ' `vueltos.Add` afirmaba "volvio" a secas: el usuario recuperaba los BYTES y perdia el
+                    ' OCULTO / SOLO LECTURA sin enterarse. Es el gemelo exacto del `Catch` de `Eliminar` que
+                    ' ya lleva esta ley; tenerla en uno solo de los dos es como se separan.
+                    ' Va a `vueltos` CON NOTA y no a `caidos` porque las dos cosas son ciertas y el usuario
+                    ' necesita las dos: el archivo SI volvio —sus bytes estan— y ademas hay algo que revisar.
+                    ' Mandarlo a `caidos` diria que no volvio, que es falso y lo mandaria a buscar una copia
+                    ' que ya no hace falta.
+                    If e.EsBorrado Then
+                        Try
+                            File.SetAttributes(e.Destino, e.Atributos)
+                        Catch ex As Exception
+                            advertencias.Add(
+                                $"  · '{IO.Path.GetFileName(e.Destino)}' recupero sus bytes, pero NO sus " &
+                                $"atributos originales ({e.Atributos}): {ex.Message}")
+                        End Try
+                    End If
+                    vueltos.Add(IO.Path.GetFileName(e.Destino))
+                    Borrar(e.Copia)              ' probada redundante: el destino ya tiene esos bytes
+                Catch
+                    caidos.Add($"  · '{IO.Path.GetFileName(e.Destino)}' NO se pudo devolver; su version " &
+                               $"anterior esta en '{IO.Path.GetFileName(e.Copia)}'")
+                End Try
+            Next
+            ' ⛔ EL INFORME SALE SI HAY ALGO QUE DECIR, y "algo" incluye una advertencia sola.
+            If caidos.Count = 0 AndAlso advertencias.Count = 0 Then Return ""
+            Dim sb As New Text.StringBuilder()
+            If caidos.Count > 0 Then
+                sb.Append("El guardado se deshizo, pero ")
+                sb.Append(caidos.Count)
+                sb.Append(" archivo(s) no volvieron solos:")
+                sb.Append(Environment.NewLine)
+                sb.Append(String.Join(Environment.NewLine, caidos))
+            End If
+
+            If advertencias.Count > 0 Then
+                If sb.Length > 0 Then sb.Append(Environment.NewLine)
+                sb.Append("Archivos recuperados con atributos incompletos:")
+                sb.Append(Environment.NewLine)
+                sb.Append(String.Join(Environment.NewLine, advertencias))
+            End If
+
+            If vueltos.Count > 0 Then
+                sb.Append(Environment.NewLine)
+                sb.Append("Si volvieron: ")
+                sb.Append(String.Join(", ", vueltos))
+            End If
+            Return sb.ToString()
+        End Function
+
+        Private Sub DeshacerYTirar(causa As String, interna As Exception)
+            Dim informe = Deshacer()
+            _InformeDeRestauracion = informe
+            ' Misma ley que el Dispose: si todo volvio, el diario no describe nada pendiente y se va.
+            If _diario IsNot Nothing AndAlso informe = "" Then _diario.Cerrar()
+            _confirmado = True          ' ya se deshizo: el Dispose no lo tiene que volver a hacer
+            Throw New IOException(causa & If(informe = "", "", Environment.NewLine & informe), interna)
+        End Sub
+    End Class
+
     ''' <summary>Nombre del slot <paramref name="n"/> de respaldo: 1 =&gt; `&lt;destino&gt;&lt;sufijo&gt;`,
     ''' 2 =&gt; `…&lt;sufijo&gt;2`, 3 =&gt; `…&lt;sufijo&gt;3`… El 1 no lleva numero para no romper los
     ''' archivos que ya estan en disco de las versiones anteriores.</summary>
@@ -423,32 +1063,77 @@ Public NotInheritable Class EscrituraEnElLugar
                If(n = 1, "", n.ToString(Globalization.CultureInfo.InvariantCulture))
     End Function
 
-    ''' <summary>Los slots de respaldo OCUPADOS, en orden desde el 1. Cada uno es una copia HEREDADA: la
-    ''' dejo una corrida que nunca confirmo su escritura (el proceso murio, o la restauracion automatica
-    ''' fallo y el mensaje le dijo al usuario donde estaba su version anterior).
-    ''' <para>Corta en el primer hueco a proposito. Si el usuario borro `.npcm.prev` a mano y dejo
-    ''' `.npcm.prev2`, esta funcion no ve la segunda: no la cuenta como heredada, no la compara y no la
-    ''' borra NUNCA. Un huerfano que sobrevive de mas es el lado seguro del error.</para></summary>
+    ''' <summary>Los slots de respaldo OCUPADOS, ordenados por número. Cada uno es una copia HEREDADA: la
+    ''' dejó una corrida que nunca confirmó su escritura (el proceso murió, o la restauración automática
+    ''' falló y el mensaje le dijo al usuario dónde estaba su versión anterior).
+    ''' <para>⛔⛔ ENUMERA AUNQUE HAYA HUECOS, y esto SUPERSEDE al docstring anterior. Antes cortaba en el
+    ''' primer número ausente y lo justificaba con «un huérfano que sobrevive de más es el lado seguro del
+    ''' error». Esa justificación ya no se sostiene, por dos motivos concretos:</para>
+    ''' <list type="bullet">
+    ''' <item>lo que hace SEGURO no borrar de más no es la ceguera, es la PRUEBA: una heredada sólo se
+    ''' descarta cuando <see cref="MismoContenido"/> demostró byte a byte que no guarda nada propio. Ver
+    ''' esa copia no la pone en peligro — la somete a la misma prueba que a todas;</item>
+    ''' <item>y no verla sí tiene costo: con `.npcm.prev` y `.npcm.prev3` en disco, la tercera quedaba
+    ''' invisible para la detección (<see cref="CopiasPendientes"/> no la nombraba), para la comparación
+    ''' (nunca se probaba redundante, así que se acumulaba para siempre) y para la limpieza.</item></list>
+    ''' <para>⚠️ EL COSTO, dicho: esto enumera la CARPETA en vez de hacer N `File.Exists`. Por eso lo usan
+    ''' sólo <see cref="GuardarConCopia"/> y los lotes, que son acciones interactivas de unos pocos archivos.
+    ''' <see cref="Escribir"/> —miles de archivos por horneado— no lo toca.</para></summary>
     Private Shared Function SlotsOcupados(destino As String, sufijo As String) As List(Of String)
-        Dim ocupados As New List(Of String)
-        Dim n As Integer = 1
-        While File.Exists(Slot(destino, sufijo, n))
-            ocupados.Add(Slot(destino, sufijo, n))
-            n += 1
-        End While
-        Return ocupados
+        Dim carpeta = IO.Path.GetDirectoryName(destino)
+        If String.IsNullOrEmpty(carpeta) Then carpeta = Environment.CurrentDirectory
+        If Not Directory.Exists(carpeta) Then Return New List(Of String)()
+
+        Dim nombreBase = IO.Path.GetFileName(destino) & sufijo
+        Dim encontrados As New List(Of Tuple(Of Integer, String))
+
+        For Each ruta In Directory.EnumerateFiles(carpeta, nombreBase & "*")
+            Dim nombre = IO.Path.GetFileName(ruta)
+            If nombre.Equals(nombreBase, StringComparison.OrdinalIgnoreCase) Then
+                encontrados.Add(Tuple.Create(1, ruta))
+                Continue For
+            End If
+
+            If Not nombre.StartsWith(nombreBase, StringComparison.OrdinalIgnoreCase) Then Continue For
+            ' La cola tiene que ser un numero >= 2 Y NADA MAS: asi `plugin.esp.npcm.prev2` entra y
+            ' `plugin.esp.npcm.prev2.viejo` o `...prevX` quedan afuera. `NumberStyles.None` rechaza signo,
+            ' espacios y separadores, que es lo que hace que "2 " o "+2" no cuenten como slot.
+            Dim cola = nombre.Substring(nombreBase.Length)
+            Dim numero As Integer
+            If Integer.TryParse(cola, Globalization.NumberStyles.None,
+                                Globalization.CultureInfo.InvariantCulture, numero) AndAlso numero >= 2 Then
+                encontrados.Add(Tuple.Create(numero, ruta))
+            End If
+        Next
+
+        Return encontrados.OrderBy(Function(x) x.Item1).Select(Function(x) x.Item2).ToList()
     End Function
 
     ''' <summary>El primer nombre de respaldo LIBRE para <paramref name="destino"/> con el sufijo dado.
     ''' <para>⛔ ESTA ES LA LEY DEL NOMBRE, Y VIVE ACA SOLA. La usa <see cref="GuardarConCopia"/> con
-    ''' <see cref="SufijoCopia"/> y la usa <c>LoadOrderActivator.WriteEntries</c> con su `.npcm.bak`, que
-    ''' no puede usar GuardarConCopia porque su respaldo tiene que sobrevivir a la escritura (lo consume
-    ''' el rollback del verify de relectura, que corre despues). Dos artefactos con vidas distintas, una
-    ''' sola ley: <b>un respaldo que ya esta en disco no se pisa jamas</b>.</para></summary>
+    ''' <see cref="SufijoCopia"/>, la usan los lotes, y la usa <c>LoadOrderActivator.WriteEntries</c> con su
+    ''' `.npcm.bak`, que no puede usar GuardarConCopia porque su respaldo tiene que sobrevivir a la
+    ''' escritura (lo consume el rollback del verify de relectura, que corre después). Artefactos con vidas
+    ''' distintas, una sola ley: <b>un respaldo que ya está en disco no se pisa jamás</b>.</para>
+    ''' <para>⛔⛔ BUSCA EL PRIMER HUECO; NO CUENTA. `Count + 1` era correcto SÓLO mientras
+    ''' <see cref="SlotsOcupados"/> cortaba en el primer hueco —con un prefijo contiguo, `Count + 1` ES el
+    ''' primer libre—. Al pasar a enumerar con huecos, ese cálculo devuelve un nombre YA OCUPADO: con
+    ''' `.prev` y `.prev3` presentes, `Count = 2` y `Count + 1 = 3` ⇒ `.prev3`, que existe. Por eso los dos
+    ''' cambios son ATÓMICOS: enumerar con huecos sin arreglar esto pisaría el respaldo del usuario, que es
+    ''' el daño exacto que esta función existe para impedir.</para>
+    ''' <para>El `File.Exists` extra del bucle no es redundancia decorativa: cubre la carrera entre el
+    ''' enumerado y la creación, y los nombres que la enumeración descarta por forma.</para></summary>
     Public Shared Function PrimerSlotLibre(destino As String, sufijo As String) As String
         If String.IsNullOrEmpty(destino) Then Throw New ArgumentException("Empty path.", NameOf(destino))
         If String.IsNullOrEmpty(sufijo) Then Throw New ArgumentException("Empty suffix.", NameOf(sufijo))
-        Return Slot(destino, sufijo, SlotsOcupados(destino, sufijo).Count + 1)
+
+        Dim ocupados = New HashSet(Of String)(SlotsOcupados(destino, sufijo), StringComparer.OrdinalIgnoreCase)
+        Dim n As Integer = 1
+        Do
+            Dim candidato = Slot(destino, sufijo, n)
+            If Not ocupados.Contains(candidato) AndAlso Not File.Exists(candidato) Then Return candidato
+            n += 1
+        Loop
     End Function
 
     ''' <summary>Comparacion BYTE POR BYTE de dos archivos. Corta por tamano primero.
@@ -500,15 +1185,22 @@ Public NotInheritable Class EscrituraEnElLugar
         Return total
     End Function
 
-    ''' <summary>FlushFileBuffers sobre un archivo ya cerrado, para el dato del usuario. Best-effort: no
-    ''' poder sincronizar no invalida una copia que ya esta escrita y verificada por tamano.</summary>
-    Private Shared Sub Sincronizar(ruta As String)
-        Try
-            Using fs As New FileStream(ruta, FileMode.Open, FileAccess.Write, FileShare.Read)
-                fs.Flush(True)
-            End Using
-        Catch
-        End Try
+    ''' <summary>Fuerza a disco un respaldo que va a ser la UNICA red antes de truncar (o borrar) el
+    ''' destino. Si no se puede garantizar la sincronizacion, la operacion aborta SIN tocar el destino.
+    ''' <para>⛔ ES ESTRICTA, Y REEMPLAZA A UNA `Sincronizar` BEST-EFFORT que se tragaba el fallo. Con
+    ''' la vieja, `GuardarConCopia` y el lote seguian de largo y truncaban el destino apoyados en un
+    ''' respaldo cuya durabilidad NADIE habia podido confirmar — o sea que la red podia no existir
+    ''' justo cuando hacia falta. La clase ya le exige esta misma frase al packer ("la red solo es red
+    ''' si llego al plato"); acá se la exige a si misma.</para>
+    ''' <para>⚠️ NO se usa en <see cref="Escribir"/>: esa ruta es salida REGENERABLE y su default de
+    ''' no-sincronizar esta MEDIDO (+2,66 a +4,53 ms por llamada, miles de archivos por corrida).</para>
+    ''' <para>`FileAccess.ReadWrite` y no `Write`: `FlushFileBuffers` necesita un handle con permiso de
+    ''' escritura, y abrir ReadWrite no cambia los bytes ni los atributos.</para></summary>
+    Private Shared Sub SincronizarRespaldo(ruta As String)
+        If String.IsNullOrEmpty(ruta) Then Throw New ArgumentException("Empty path.", NameOf(ruta))
+        Using fs As New FileStream(ruta, FileMode.Open, FileAccess.ReadWrite, FileShare.Read)
+            fs.Flush(flushToDisk:=True)
+        End Using
     End Sub
 
     Private Shared Sub Borrar(ruta As String)

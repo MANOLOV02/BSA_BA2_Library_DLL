@@ -93,6 +93,58 @@ Namespace BethesdaArchive.Core
             }
         End Function
 
+        ''' <summary>
+        ''' The DDS header that corresponds to a BA2 DX10 entry's metadata — the INVERSE of the strip
+        ''' that <see cref="SplitDdsBytes"/> performs.
+        '''
+        ''' ⛔ ESTA ES LA UNICA CASA DE ESE ENCODE, y por eso existe la funcion en vez de llamar a
+        ''' `Loader.EncodeDDSHeader` en cada lado. La llaman DOS: el reader, cuando reconstruye el .dds
+        ''' al extraer de un BA2 (Bsa_Ba2Reader, EntryDX10.Extract), y el gestor de archives, cuando
+        ''' extrae al disco una fila que tiene el payload despojado (Ba2_Bsa_Manager.GuardadoDeArchive).
+        ''' Con dos implementaciones, la del gestor producia un .dds distinto del que da el reader — y
+        ''' eso no es una diferencia cosmetica: `arraySize` sale de `IsCubemap`, no de `Faces`, y el
+        ''' `mipLevels` de 0 se normaliza a 1. Un segundo encode con otra convencion es como se escriben
+        ''' dos .dds distintos para la misma textura.
+        '''
+        ''' El round-trip lo mide `Tools\Ba2ManagerSaveGate` (H3a): abrir un BA2 DX10 y extraerlo tiene
+        ''' que dar byte a byte lo mismo que `BethesdaReader.ExtractToMemory`.
+        ''' </summary>
+        Public Shared Function EncodeDdsHeader(dxgiFormat As Integer, width As Integer, height As Integer,
+                                               mipCount As Integer, isCubemap As Boolean) As Byte()
+            Return Loader.EncodeDDSHeader(dxgiFormat, width, height,
+                                          If(isCubemap, 6, 1),
+                                          If(mipCount <= 0, 1, mipCount),
+                                          isCubemap)
+        End Function
+
+        ''' <summary>
+        ''' Rebuilds the complete .dds file from a stripped BA2 DX10 payload plus its metadata — the
+        ''' INVERSE of <see cref="FromDdsBytes"/>.
+        '''
+        ''' ⛔ CUANDO SE USA: solo sobre bytes que son un payload DESPOJADO. Quien tiene el archivo DDS
+        ''' completo (BSA, BA2 GNRL, un .dds suelto) NO pasa por aca — anteponer una segunda cabecera lo
+        ''' destruye. Lo que distingue los dos estados es la metadata DX10 (Width/MipCount &gt; 0), no la
+        ''' extension del archivo. La guarda de abajo es la MISMA que el writer aplica a la ida
+        ''' (Ba2WriterDX10.Write rechaza un Data con magic 'DDS '), por el mismo motivo: si estos bytes
+        ''' ya son un DDS, alguien se equivoco de camino y el error tiene que decirlo, no producir un
+        ''' archivo con dos cabeceras.
+        ''' </summary>
+        Public Shared Function ToDdsBytes(payload As Byte(), dxgiFormat As Integer, width As Integer,
+                                          height As Integer, mipCount As Integer, isCubemap As Boolean) As Byte()
+            Dim datos As Byte() = If(payload, Array.Empty(Of Byte)())
+            If HasDdsMagic(datos) Then
+                Throw New InvalidDataException(
+                    "Dx10Importer.ToDdsBytes: the payload already starts with the DDS magic — it is a " &
+                    "complete DDS file, not a stripped BA2 DX10 payload. Write it verbatim instead.")
+            End If
+
+            Dim header As Byte() = EncodeDdsHeader(dxgiFormat, width, height, mipCount, isCubemap)
+            Dim salida(header.Length + datos.Length - 1) As Byte
+            Buffer.BlockCopy(header, 0, salida, 0, header.Length)
+            If datos.Length > 0 Then Buffer.BlockCopy(datos, 0, salida, header.Length, datos.Length)
+            Return salida
+        End Function
+
         ''' <summary>Convenience wrapper that reads a DDS file from disk and forwards to FromDdsBytes.</summary>
         Public Shared Function FromDdsFile(ddsPath As String, dataRoot As String) As VirtualEntry
             If String.IsNullOrWhiteSpace(ddsPath) Then Throw New ArgumentException("ddsPath requerido.")
