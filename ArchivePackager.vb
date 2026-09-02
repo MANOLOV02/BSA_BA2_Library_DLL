@@ -1,5 +1,6 @@
 ﻿Option Strict On
 Imports System.IO
+Imports System.Security.Cryptography
 
 Namespace BethesdaArchive.Core
 
@@ -117,12 +118,55 @@ Namespace BethesdaArchive.Core
         Public ReadOnly Skipped As New List(Of String)
         ' Newly created dummy plugins (one per new slot). Existing plugin paths are NOT listed.
         Public ReadOnly Plugins As New List(Of String)
+
+        ''' <summary>El tope por archive que esta corrida REALMENTE aplicó, en bytes.
+        ''' <para>⛔ EXISTE PORQUE EL TOPE PUEDE NO SER EL QUE PIDIÓ EL LLAMADOR. En la rama BSA el formato
+        ''' manda (2 GiB−1, ver <see cref="PackagerRequest.BsaMaxOffset"/>) y el pedido se capa. Antes eso se
+        ''' hacía MUTANDO <c>req.MaxArchiveBytes</c> —el objeto del llamador— y en silencio: quien pedía
+        ''' 3 GiB para Skyrim volvía con su request cambiado abajo y sin manera de enterarse. Ahora el
+        ''' request no se toca y el número efectivo sale por acá.</para></summary>
+        Public Property TopeAplicado As Long
+
+        ''' <summary>True cuando <see cref="TopeAplicado"/> es MENOR que el <c>MaxArchiveBytes</c> pedido,
+        ''' o sea cuando el formato bajó el tope. La UI lo puede decir sin comparar contra una constante
+        ''' que no es suya.</summary>
+        Public Property TopeFueCapado As Boolean
     End Class
 
     ''' <summary>Set of archive + plugin files in OutputDir whose names share a ModBaseName prefix.</summary>
     Public NotInheritable Class ArchiveSetInfo
         Public ReadOnly Archives As New List(Of String)   ' .ba2 / .bsa
         Public ReadOnly Plugins As New List(Of String)    ' .esp / .esm / .esl
+
+        ''' <summary>Archivos que ACOMPAÑAN al set y que NINGÚN camino del packer consume ni borra:
+        ''' EXCLUSIVAMENTE los <c>&lt;archive&gt;.ba2.bak</c> / <c>.bsa.bak</c> que dejó el rename de
+        ''' 2.0.2 (hasta 3 GiB cada uno).
+        ''' <para>⚠️ LOS <c>&lt;suelto&gt;.bak.unpack</c> NO ESTÁN ACÁ, y este párrafo decía dos cosas
+        ''' falsas: que sí, y que los dejaba "el Unpack viejo". Los deja el Unpack ACTUAL, a propósito y
+        ''' cada vez que pisa un suelto del usuario (ver el <c>PrimerSlotLibre</c> del cuerpo de
+        ''' <c>Unpack</c>). Y no pueden entrar en esta lista por CONSTRUCCIÓN: viven bajo
+        ''' <c>LooseDataDir</c> con el nombre del SUELTO, no bajo <c>OutputDir</c> con el prefijo del mod,
+        ''' así que el barrido de abajo —que enumera <c>&lt;modBaseName&gt;*</c> en <c>OutputDir</c>— no
+        ''' los ve. Los reporta <see cref="UnpackResult.Huerfanos"/>, que es quien conoce esa carpeta.
+        ''' Son dos listas de dos caminos distintos.</para>
+        ''' <para>⛔ ESTA LISTA NO BORRA NADA Y NO EXISTE PARA HABILITAR UN BORRADO. Es el REPORTE, y ahora
+        ''' es verdad que alguien lo lee: <c>Wardrobe_Manager\WM_PackUnpack.Pack</c> los cuenta, suma su
+        ''' tamaño, escribe la lista completa a un ARCHIVO de verdad
+        ''' (<c>WM_PackUnpack.EscribirReporte</c> — al lado del exe, con fallback a <c>%TEMP%</c>) y
+        ''' publica el aviso con esa RUTA en <c>WM_PackUnpack.UltimoAvisoHuerfanos</c>, que
+        ''' <c>Config_Form</c> concatena al resumen persistente del Pack. NO va por <c>Logger</c>: en
+        ''' Release está apagado y su setter descarta cualquier True, así que remitir ahí sería pedirle al
+        ''' usuario algo imposible. Sin diálogo, porque ese camino no tiene ninguno.
+        ''' Borrar archivos del disco del usuario es decisión del usuario, y un <c>.bak</c> de 2.0.2 puede
+        ''' ser la única copia de un archive que aquel rename dejó a mitad — borrarlo a ciegas es
+        ''' exactamente el daño que <c>EscrituraEnElLugar</c> existe para no cometer.</para>
+        ''' <para>⚠️ Hasta esta ronda el párrafo de arriba decía "el llamador los muestra" y NO LOS LEÍA
+        ''' NADIE: eran hasta 3 GiB por pieza ocupando disco sin que nada los nombrara. Un docstring que
+        ''' describe un consumidor inexistente es una afirmación falsa, no una intención.</para>
+        ''' <para>MEDIDO al escribir esto, sobre el disco real del usuario: <b>0 huérfanos</b> en el Data de
+        ''' FO4 (61 <c>WM_ClonePack*</c> sanos, 89,87 GiB) y 0 en el de SSE. O sea que el defecto es LATENTE
+        ''' acá y lo que esta lista cubre son las instalaciones que vienen de 2.0.2.</para></summary>
+        Public ReadOnly Huerfanos As New List(Of String)
     End Class
 
     Public NotInheritable Class UnpackRequest
@@ -138,6 +182,73 @@ Namespace BethesdaArchive.Core
         Public ReadOnly LooseFilesWritten As New List(Of String)
         Public ReadOnly ArchivesRemoved As New List(Of String)
         Public ReadOnly PluginsRemoved As New List(Of String)
+
+        ''' <summary>Los archives del set que SIGUEN EN DISCO al terminar: <c>info.Archives</c> menos
+        ''' <see cref="ArchivesRemoved"/>. Se llena SIEMPRE, salga la corrida bien, mal o cancelada.
+        ''' <para>⛔⛔ EXISTE PORQUE EL CONTRATO DEL LLAMADOR ES ASIMÉTRICO Y ESO DEJABA HUÉRFANOS.
+        ''' <c>WM_PackUnpack.Unpack</c> DESREGISTRA los N archives del set ANTES de llamar —y tiene que
+        ''' hacerlo, si no se siguen sirviendo entradas de archives que están por borrarse— y sólo vuelve
+        ''' a registrar SUELTOS al final. Cuando la corrida sale temprano (el <c>Exit For</c> de un
+        ''' archive fallido, o una CANCELACIÓN, que ni excepción tira) los archives POSTERIORES quedan
+        ''' <b>vivos en disco y desmontados del diccionario</b>: su contenido es invisible para la app,
+        ''' sin que nada haya fallado con ellos y sin nada en el resultado que permitiera remontarlos.
+        ''' Con esta lista el llamador los vuelve a montar con <c>RegisterArchive</c>.</para>
+        ''' <para>⛔ NO es lo mismo que "los que fallaron": un archive perfectamente sano que estaba
+        ''' DESPUÉS del que cortó la corrida también entra acá, y es justamente el caso que se perdía.</para>
+        ''' <para>Gate: <c>Tools\UnpackSueltosGate</c> U8 (la lista existe y los nombra) y
+        ''' <c>Tools\WmEscrituraGate</c> D7/D7.1 (el llamador los remonta en los DOS caminos).</para></summary>
+        Public ReadOnly ArchivesConservados As New List(Of String)
+
+        ''' <summary>Respaldos que ESTA corrida dejó al pisar un suelto que ya existía y NO era nuestro:
+        ''' <c>&lt;suelto&gt;.bak.unpack</c>, <c>….bak.unpack2</c>, <c>…3</c>… (primer slot LIBRE, así que un
+        ''' segundo Unpack nunca destruye el respaldo del primero).
+        ''' <para>⛔ SON DEL USUARIO Y SE QUEDAN: nadie los borra, a propósito — es la misma postura, y el
+        ''' mismo costo declarado, que la copia heredada de <c>GuardarConCopia</c>.</para>
+        ''' <para>SE MUESTRAN, y ahora es verdad: <c>Wardrobe_Manager\Config_Form.UnpackButton_Click</c> los
+        ''' nombra en el label al salir bien y los lista enteros en el diálogo de un unpack PARCIAL
+        ''' (<see cref="UnpackParcialException"/>). Hasta que ese llamador existió, este párrafo decía "para
+        ''' que el llamador se los pueda mostrar" y NADIE los leía: eran archivos del usuario ocupando
+        ''' disco sin que nada se lo dijera.</para></summary>
+        Public ReadOnly CopiasDeSueltos As New List(Of String)
+
+        ''' <summary><c>&lt;suelto&gt;.bak.unpack</c> que YA estaban en disco al empezar: los dejó una corrida
+        ''' anterior.
+        ''' <para>⛔ SE REPORTAN, NO SE BORRAN. Misma postura que <see cref="ArchiveSetInfo.Huerfanos"/>, y
+        ''' el mismo lector: ver <see cref="CopiasDeSueltos"/>.</para></summary>
+        Public ReadOnly Huerfanos As New List(Of String)
+
+        ''' <summary>Entradas que NO se pudieron escribir, una línea por entrada, con archivo y causa.
+        ''' Cuando esta lista no está vacía <c>Unpack</c> termina TIRANDO — pero recién al final, después de
+        ''' haberle dado su chance a todo lo demás, y con este mismo resultado ADENTRO de la excepción
+        ''' (<see cref="UnpackParcialException"/>). Ver el ⛔ del cuerpo de <c>Unpack</c>.</summary>
+        Public ReadOnly Fallos As New List(Of String)
+    End Class
+
+    ''' <summary>El <c>Unpack</c> que termina con entradas fallidas, <b>llevando su resultado adentro</b>.
+    ''' <para>⛔⛔ POR QUE NO ES UN <c>IOException</c> PELADO, QUE ES LO QUE HABIA. Este camino no es "no
+    ''' pasó nada": todo lo que SÍ se extrajo ya está en disco. El llamador
+    ''' (<c>Wardrobe_Manager\WM_PackUnpack.Unpack</c>) DESREGISTRA los archives del <c>FilesDictionary</c>
+    ''' ANTES de llamar —tiene que hacerlo, para que no se sirvan entradas de un archive que se va a
+    ''' borrar— y registra los sueltos DESPUÉS. Con la excepción pelada nunca llegaba a la segunda mitad:
+    ''' el diccionario quedaba sin las entradas del archive Y sin las de los sueltos, o sea contenido en
+    ''' disco que la app no ve, hasta un <c>Fill_Dictionary</c> completo. Llevando el resultado, el
+    ''' llamador registra lo que se escribió y muestra los fallos: las dos cosas, sin mentir ninguna.</para>
+    ''' <para>Deriva de <c>IOException</c> a propósito: quien ya lo atrapaba —el <c>Catch ex As Exception</c>
+    ''' de <c>Config_Form.UnpackButton_Click</c> y cualquier otro— lo sigue atrapando igual, y el
+    ''' <c>Message</c> es el mismo texto que antes.</para>
+    ''' <para>Gate: <c>Tools\UnpackSueltosGate</c> U6.</para></summary>
+    Public Class UnpackParcialException
+        Inherits IOException
+
+        ''' <summary>Lo que la corrida alcanzó a hacer: <c>LooseFilesWritten</c> (para registrar),
+        ''' <c>Fallos</c> (para mostrar), <c>CopiasDeSueltos</c> y <c>Huerfanos</c> (para reportar), y los
+        ''' archives/plugins que sí se borraron. Nunca es Nothing.</summary>
+        Public ReadOnly Property Resultado As UnpackResult
+
+        Public Sub New(mensaje As String, resultado As UnpackResult)
+            MyBase.New(mensaje)
+            Me.Resultado = If(resultado, New UnpackResult())
+        End Sub
     End Class
 
     ''' <summary>
@@ -168,11 +279,17 @@ Namespace BethesdaArchive.Core
         Private NotInheritable Class DiffResult
             Public Property Kind As DiffKind
             ' Paths where the bundle entry has the same length + CRC32 as the existing archive
-            ' entry. These are stream-copied verbatim from .bak.
+            ' entry. These are stream-copied verbatim from the ORIGINAL archive (see below).
             Public ReadOnly UnchangedPaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
             ' Paths that exist in the archive but are NOT in the bundle. The packager preserves
-            ' them automatically (stream-copy from .bak) — Pack semantics are "merge with existing",
-            ' not "the bundle is the complete desired archive state".
+            ' them automatically (stream-copy from the ORIGINAL) — Pack semantics are "merge with
+            ' existing", not "the bundle is the complete desired archive state".
+            '
+            ' ⛔ "THE ORIGINAL", NO ".bak". Todos estos comentarios decian `.bak` porque el packer
+            ' RENOMBRABA el archive a `<archive>.bak` y leia de ahi. Eso se fue en 2.0.5 (el rename sacaba
+            ' el archive de su mod bajo MO2 y cortaba el hardlink en Vortex — ver el ⛔ de PackOneArchive):
+            ' hoy la fuente pass-through es el archive ORIGINAL, abierto para lectura EN SU LUGAR mientras
+            ' se escribe el `.new` al lado. No queda ningun `.bak` en el camino.
             Public ReadOnly PreservePaths As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
         End Class
 
@@ -196,6 +313,28 @@ Namespace BethesdaArchive.Core
             Public ReadOnly AnchoredByBucket As New Dictionary(Of BucketKind, List(Of VirtualEntry))
         End Class
 
+        ''' <summary>Empaqueta <paramref name="req"/> contra el archive set que ya está en
+        ''' <c>OutputDir</c>: censa los slots, distribuye las entradas y reescribe SOLO los archives que
+        ''' cambiaron. La semántica es de MERGE ("upsert"), no de reemplazo: lo que ya estaba en un archive
+        ''' y no viene en el bundle se preserva (salvo que esté en <c>ExcludePaths</c>).
+        ''' <para>⛔ UNA REQUEST VACÍA PUEDE TIRAR, Y NO ES UN BUG. Lo PRIMERO que hace este método —antes de
+        ''' mirar si hay entradas— es barrer el set y recuperar los volcados cortados de corridas anteriores
+        ''' (ver el ⛔ de <c>RecuperarVolcadosCortados</c> en el cuerpo). Si no había ningún par
+        ''' <c>.new</c>/sello pendiente, una request vacía sigue siendo EXACTAMENTE el no-op de siempre; si
+        ''' lo había, se reparó o se falla. Es deliberado: un archive truncado no se puede quedar roto
+        ''' porque justo el pack que lo encontró no tenía nada que escribir. Un llamador que use
+        ''' <c>Pack</c> vacío como sonda barata tiene que estar preparado para la excepción.</para>
+        ''' <para>⛔ EL TOPE POR ARCHIVE PUEDE NO SER EL QUE PEDISTE. En la rama BSA lo baja el formato a
+        ''' <see cref="PackagerRequest.BsaMaxOffset"/> (2 GiB−1). <b><paramref name="req"/> NO se modifica</b>:
+        ''' el número que se aplicó sale en <see cref="PackagerResult.TopeAplicado"/> y
+        ''' <see cref="PackagerResult.TopeFueCapado"/>.</para>
+        ''' <para>Lo que devuelve cada lista de <see cref="PackagerResult"/>: <c>Archives</c> = los que ESTA
+        ''' corrida reescribió y verificó; <c>Skipped</c> = los que quedaron byte-idénticos (diff Unchanged)
+        ''' o los que quedaron vacíos por exclusión y se borraron; <c>Plugins</c> = SOLO los dummy nuevos
+        ''' (un plugin que ya existía no se lista).</para>
+        ''' <para>Fallos: cualquier error deja el archive entregable como estaba o conserva el par
+        ''' <c>.new</c>/sello, que es la única copia íntegra del archive nuevo; nunca las dos cosas rotas a
+        ''' la vez. Ver los ⛔ de <c>PackOneArchive</c> y <c>RecuperarVolcadoCortado</c>.</para></summary>
         Public Shared Function Pack(req As PackagerRequest) As PackagerResult
             ArgumentNullException.ThrowIfNull(req)
             If String.IsNullOrWhiteSpace(req.ModBaseName) Then Throw New ArgumentException("ModBaseName is empty.", NameOf(req))
@@ -214,8 +353,17 @@ Namespace BethesdaArchive.Core
             ' MEDIDO hoy: 29 `WM_ClonePack*` de 3,00 GiB en el Data de FO4 (BA2, sanos) y 0 archives por
             ' encima de 2 GiB−1 en SSE ⇒ el defecto es LATENTE, y el disparador es este mismo botón
             ' apuntando a Skyrim, donde la app ya demostró 29 veces que llena hasta el tope.
-            If req.Game = GameKind.SSE_BSA AndAlso req.MaxArchiveBytes > PackagerRequest.BsaMaxOffset Then
-                req.MaxArchiveBytes = PackagerRequest.BsaMaxOffset
+            '
+            ' ⛔⛔ Y EL TOPE NO MUTA EL REQUEST DEL LLAMADOR. Acá había `req.MaxArchiveBytes = ...`: el
+            ' packer le cambiaba el objeto a quien lo llamó, en silencio y sin devolver nada que lo dijera.
+            ' Hoy los tres llamadores construyen una `PackagerRequest` nueva por corrida y ninguno vuelve a
+            ' leer el campo después del Pack (medido: 0 lecturas de `req.MaxArchiveBytes` fuera de este
+            ' archivo), asi que el defecto era LATENTE — pero el disparador es cualquiera que reutilice la
+            ' request entre chunks, o que la muestre/loguee después. El tope efectivo vive en una LOCAL y
+            ' viaja por parámetro; lo que se aplicó sale por el resultado.
+            Dim topeEfectivo As Long = req.MaxArchiveBytes
+            If req.Game = GameKind.SSE_BSA AndAlso topeEfectivo > PackagerRequest.BsaMaxOffset Then
+                topeEfectivo = PackagerRequest.BsaMaxOffset
             End If
 
             EnsureDir(req.OutputDir & Path.DirectorySeparatorChar)
@@ -238,7 +386,10 @@ Namespace BethesdaArchive.Core
             ' cierran juntas, sin maquinaria extra.
             RecuperarVolcadosCortados(req)
 
-            Dim result As New PackagerResult()
+            Dim result As New PackagerResult() With {
+                .TopeAplicado = topeEfectivo,
+                .TopeFueCapado = (topeEfectivo < req.MaxArchiveBytes)
+            }
             ' Delete-only Pack: an empty bundle with ExcludePaths still runs (it strips the excluded entries
             ' from the existing target archive). Only a truly empty request (no entries AND no exclusions) is a no-op.
             ' ⛔ EL NO-OP ES DE LA DISTRIBUCION, NO DE LA RECUPERACION: el barrido de arriba ya corrio. Si no
@@ -254,7 +405,7 @@ Namespace BethesdaArchive.Core
             Dim slots = DiscoverSlots(req, buckets)
 
             ' --- Distribute every bundle entry to a slot/bucket pair. ---
-            DistributeEntries(req, slots, buckets)
+            DistributeEntries(req, slots, buckets, topeEfectivo)
 
             ' --- Emit each affected slot. Order: lower SlotNumber first, so the unsuffixed plugin
             '     gets written before its numbered companions. ---
@@ -383,7 +534,12 @@ Namespace BethesdaArchive.Core
         ' Slot 1 is always created (with IsNew=True if it didn't exist on disk) so the anchor
         ' plugin is "<base>.esp" without a number prefix.
         ' --------------------------------------------------------------------------------------
-        Private Shared Sub DistributeEntries(req As PackagerRequest, slots As List(Of PluginSlot), buckets As BucketKind())
+        ''' <summary><paramref name="topeEfectivo"/> es el tope por archive que ESTA corrida aplica: el
+        ''' <c>MaxArchiveBytes</c> pedido, o el del formato si el juego lo baja (BSA: 2 GiB−1). ⛔ LOS CINCO
+        ''' usos de acá adentro leen el parámetro y NINGUNO vuelve a `req.MaxArchiveBytes`: si uno solo se
+        ''' escapa, el tope queda partido en dos y es peor que la mutación que esto vino a sacar.</summary>
+        Private Shared Sub DistributeEntries(req As PackagerRequest, slots As List(Of PluginSlot),
+                                             buckets As BucketKind(), topeEfectivo As Long)
             ' Ensure slot 1 always exists.
             Dim hasSlot1 = slots.Any(Function(s) s.SlotNumber = 1)
             If Not hasSlot1 Then
@@ -438,7 +594,7 @@ Namespace BethesdaArchive.Core
                 Dim chosen As PluginSlot = Nothing
                 For Each slot In slots
                     Dim cur As Long = slot.SizeByBucket(bucket) + proposedFreeBytes(slot)
-                    If cur + addSize <= req.MaxArchiveBytes Then
+                    If cur + addSize <= topeEfectivo Then
                         chosen = slot
                         Exit For
                     End If
@@ -447,7 +603,7 @@ Namespace BethesdaArchive.Core
                 If chosen Is Nothing Then
                     If req.Overflow = ArchiveOverflowPolicy.ThrowOnExceed Then
                         Throw New InvalidOperationException(
-                            $"Bundle exceeds MaxArchiveBytes ({req.MaxArchiveBytes:N0} bytes) and Overflow=ThrowOnExceed.")
+                            $"Bundle exceeds MaxArchiveBytes ({topeEfectivo:N0} bytes) and Overflow=ThrowOnExceed.")
                     End If
                     Dim nextNumber As Integer = (slots.Max(Function(s) s.SlotNumber)) + 1
                     chosen = NewSlot(nextNumber, req, buckets)
@@ -492,7 +648,7 @@ Namespace BethesdaArchive.Core
                 ' Real free space available in this slot at the cap. If below the configured
                 ' minimum, the rewrite cost (moving totalExistingSize bytes) doesn't justify
                 ' squeezing a tiny amount of new content in.
-                Dim freeSpace As Long = req.MaxArchiveBytes - totalExistingSize
+                Dim freeSpace As Long = topeEfectivo - totalExistingSize
                 If freeSpace >= req.MinFreeSpaceToFill Then Continue For
 
                 ' Not enough room to be worth it — revert this slot's free proposals.
@@ -513,7 +669,7 @@ Namespace BethesdaArchive.Core
                     For Each slot In slots
                         If rejectedSlots.Contains(slot) Then Continue For
                         Dim cur As Long = slot.SizeByBucket(bucket) + proposedFreeBytes(slot)
-                        If cur + addSize <= req.MaxArchiveBytes Then
+                        If cur + addSize <= topeEfectivo Then
                             chosen = slot
                             Exit For
                         End If
@@ -522,7 +678,7 @@ Namespace BethesdaArchive.Core
                     If chosen Is Nothing Then
                         If req.Overflow = ArchiveOverflowPolicy.ThrowOnExceed Then
                             Throw New InvalidOperationException(
-                                $"Bundle exceeds MaxArchiveBytes after threshold reject ({req.MaxArchiveBytes:N0} bytes).")
+                                $"Bundle exceeds MaxArchiveBytes after threshold reject ({topeEfectivo:N0} bytes).")
                         End If
                         Dim nextNumber As Integer = (slots.Max(Function(s) s.SlotNumber)) + 1
                         chosen = NewSlot(nextNumber, req, buckets)
@@ -641,6 +797,195 @@ Namespace BethesdaArchive.Core
         ''' bueno.</summary>
         Private Const SUFIJO_SELLO As String = ".ok"
 
+        ''' <summary>Sufijo del respaldo que <c>Unpack</c> deja cuando el suelto que va a escribir YA existía
+        ''' y no era nuestro. Es RETENCIÓN, no red de crash: se queda en disco hasta que el usuario lo
+        ''' borre, igual que la copia heredada de <c>GuardarConCopia</c> (ver su ⚠️ "EL COSTO"). Por eso NO
+        ''' se usa <c>SufijoCopia</c>: ese lo administra <c>GuardarConCopia</c>, que borra su copia al salir
+        ''' bien — mezclarlos haría que una escritura exitosa se llevara este respaldo puesto.</summary>
+        Private Const SUFIJO_BAK_UNPACK As String = ".bak.unpack"
+
+        ''' <summary>Magia + version del sello. El sello es metadata INTERNA de la app (no es un formato del
+        ''' juego), asi que la forma se elige — lo que no se elige es que tenga que ser auto-describible.
+        ''' <para>⛔ Y ES LO QUE DISTINGUE UN SELLO VIEJO. Hasta 2.0.7 el sello se escribia con
+        ''' <c>File.WriteAllBytes(..., Array.Empty(Of Byte)())</c>: CERO BYTES, o sea que no registraba NADA.
+        ''' Un archivo vacio no puede empezar con esta magia, asi que la deteccion es por construccion y no
+        ''' hay heuristica ninguna.</para></summary>
+        Private Const MAGIA_SELLO As String = "NPCMSEAL1"
+
+        ''' <summary>Lo que el sello REGISTRA del `.new`: su largo y su SHA-256. Es todo lo que hace falta
+        ''' para contestar de forma DETERMINISTA las dos preguntas que antes se contestaban por muestreo:
+        ''' "¿este `.new` es el que verifico la corrida muerta?" y "¿el entregable YA es ese `.new`?".
+        ''' <para>⛔ POR QUE NO ALCANZA EL LARGO SOLO, y no es opinion mia: la ley ya esta escrita en
+        ''' <c>EscrituraEnElLugar.MismoContenido</c> — <i>"NO alcanza con comparar el tamano… dos archivos
+        ''' distintos con la misma longitud existen, y aca el precio de equivocarse es borrar el unico
+        ''' ejemplar del dato del usuario"</i>. Es exactamente esta situacion: del lado equivocado de esa
+        ''' comparacion se borra el `.new`, que es la unica copia integra del archive nuevo.</para>
+        ''' <para>El largo va igual y va PRIMERO porque es el discriminante barato: descarta el caso comun
+        ''' (el volcado cortado) sin leer un byte de payload.</para></summary>
+        Private NotInheritable Class RegistroDeSello
+            Public ReadOnly Largo As Long
+            Public ReadOnly HashHex As String
+
+            Public Sub New(largo As Long, hashHex As String)
+                Me.Largo = largo
+                Me.HashHex = hashHex
+            End Sub
+
+            Public Function Coincide(otro As RegistroDeSello) As Boolean
+                If otro Is Nothing Then Return False
+                Return Largo = otro.Largo AndAlso
+                       String.Equals(HashHex, otro.HashHex, StringComparison.OrdinalIgnoreCase)
+            End Function
+
+            Public Overrides Function ToString() As String
+                Return $"{Largo:N0} B / {HashHex.Substring(0, Math.Min(16, HashHex.Length))}…"
+            End Function
+        End Class
+
+        ''' <summary>Largo + SHA-256 de un archivo, en UNA lectura secuencial.
+        ''' <para>⚠️ EL COSTO, dicho y no escondido. La idea original era hashear AL VUELO mientras
+        ''' <c>WriteArchive</c> escribe, para que el sello saliera gratis. <b>No se puede</b>, y no es una
+        ''' opinion: los dos writers SALTAN por el stream de salida para parchear offsets ya escritos
+        ''' (<c>Ba2Writer.vb:331,333,543,545,761,763</c> y <c>BSAWriter.vb:371,383,400,423,445</c>), asi que
+        ''' los bytes no pasan una sola vez ni en orden y un hash incremental daria cualquier cosa. Por eso
+        ''' esto es una relectura completa del `.new`: <b>+1·Σ leidos por archive reescrito</b>, encima de
+        ''' los 2·Σ escritos + 1·Σ leidos que el volcado ya paga. El numero real lo mide
+        ''' <c>Tools\PackVolcadoCostoProbe</c>.</para>
+        ''' <para>SHA-256 y no CRC32: <c>IncrementalHash</c> ya viene incremental de fabrica, y el CRC32 de
+        ''' la libreria (<c>Ba2WriterCommon.Crc32Bytes</c>) toma un array entero — usarlo obligaria a
+        ''' escribir una version incremental nueva para no materializar 3 GiB en RAM.</para></summary>
+        Private Shared Function HuellaDeArchivo(path As String) As RegistroDeSello
+            Using fs As New FileStream(path, FileMode.Open, FileAccess.Read,
+                                       FileShare.Read Or FileShare.Delete, 1024 * 1024)
+                Using hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256)
+                    Dim buffer(1024 * 1024 - 1) As Byte
+                    Dim total As Long = 0
+                    Do
+                        Dim n = fs.Read(buffer, 0, buffer.Length)
+                        If n <= 0 Then Exit Do
+                        hash.AppendData(buffer, 0, n)
+                        total += n
+                    Loop
+                    Return New RegistroDeSello(total, Convert.ToHexString(hash.GetHashAndReset()))
+                End Using
+            End Using
+        End Function
+
+        ''' <summary>Escribe el sello y lo SINCRONIZA. Contenido: una linea ASCII
+        ''' <c>NPCMSEAL1 &lt;largo&gt; &lt;sha256-hex&gt;</c>.
+        ''' <para>⛔ EL ORDEN ES LA LEY Y NO ES DECORATIVO: el `.new` se sincroniza ANTES de que esto corra
+        ''' (ver <c>PackOneArchive</c>). Si el sello llegara al plato antes que los bytes que describe, el
+        ''' par volveria a mentir exactamente como mentia con el sello vacio — solo que ahora con
+        ''' autoridad.</para></summary>
+        Private Shared Sub EscribirSelloSincronizado(selloPath As String, registro As RegistroDeSello)
+            Dim linea = $"{MAGIA_SELLO} {registro.Largo.ToString(Globalization.CultureInfo.InvariantCulture)} {registro.HashHex}" & vbLf
+            Dim bytes = Text.Encoding.ASCII.GetBytes(linea)
+            Using fs As New FileStream(selloPath, FileMode.Create, FileAccess.Write, FileShare.Read)
+                fs.Write(bytes, 0, bytes.Length)
+                fs.Flush(True)
+            End Using
+        End Sub
+
+        ''' <summary>Lee el sello. Devuelve <c>Nothing</c> cuando lo que hay en disco NO es un sello de este
+        ''' formato — el vacio de 2.0.7 incluido.
+        ''' <para>⛔ UN SELLO QUE NO ESTA EN ESTE FORMATO NO PRUEBA NADA, Y POR LO TANTO NO ES UN SELLO. No
+        ''' hay modo legacy que le crea "un poquito" al sello vacio: creerle era justamente el defecto
+        ''' —autorizaba a volcar a ciegas contra un control que mira el 0,2 % de las entradas—. El llamador
+        ''' lo trata como el caso YA legislado `.new` SIN sello: se descarta, no se vuelca.</para>
+        ''' <para>Costo declarado de esa decision: si alguien actualiza justo con un par pendiente de la
+        ''' version anterior, pierde ESA recuperacion y tiene que re-empaquetar. Su archive entregable no se
+        ''' toca. MEDIDO al escribir esto: 0 pares pendientes en las dos carpetas Data del usuario.</para>
+        ''' <para>No distingue "no existe" de "esta corrupto" a proposito: las dos respuestas son la misma
+        ''' —no hay sello— y el llamador hace lo mismo en los dos casos.</para></summary>
+        Private Shared Function LeerSello(selloPath As String) As RegistroDeSello
+            Try
+                Dim fi As New FileInfo(selloPath)
+                ' Un sello sano son ~80 bytes. El tope corta un archivo cualquiera que haya caido con ese
+                ' nombre antes de leerlo entero; no es una tolerancia sobre el contenido.
+                If Not fi.Exists OrElse fi.Length = 0 OrElse fi.Length > 4096 Then Return Nothing
+
+                Dim texto = File.ReadAllText(selloPath, Text.Encoding.ASCII).Trim()
+                Dim partes = texto.Split(New Char() {" "c}, StringSplitOptions.RemoveEmptyEntries)
+                If partes.Length <> 3 Then Return Nothing
+                If Not String.Equals(partes(0), MAGIA_SELLO, StringComparison.Ordinal) Then Return Nothing
+
+                Dim largo As Long
+                If Not Long.TryParse(partes(1), Globalization.NumberStyles.None,
+                                     Globalization.CultureInfo.InvariantCulture, largo) Then Return Nothing
+                If largo <= 0 Then Return Nothing
+
+                ' SHA-256 en hex son 64 caracteres. Cualquier otra cosa no es este formato.
+                If partes(2).Length <> 64 Then Return Nothing
+                For Each ch In partes(2)
+                    If Not Uri.IsHexDigit(ch) Then Return Nothing
+                Next
+
+                Return New RegistroDeSello(largo, partes(2))
+            Catch
+                ' No poder leer el sello es "no hay sello": la respuesta segura es la misma.
+                Return Nothing
+            End Try
+        End Function
+
+        ''' <summary>FlushFileBuffers sobre un archivo ya cerrado. Se abre con <c>OpenOrCreate</c> y NO se
+        ''' trunca: es la misma forma que usa <c>EscrituraEnElLugar.Sincronizar</c>.
+        ''' <para>⛔ ACA NO ES BEST-EFFORT. En <c>EscrituraEnElLugar</c> el fallo se traga porque la copia ya
+        ''' esta escrita y verificada por tamaño; aca el `.new` esta por convertirse en "la unica copia
+        ''' integra" y el sello esta por AFIRMARLO. Si no se pudo sincronizar, esa afirmacion no se puede
+        ''' sostener y el sello NO se escribe.</para></summary>
+        Private Shared Sub SincronizarArchivo(path As String)
+            Using fs As New FileStream(path, FileMode.Open, FileAccess.Write, FileShare.Read)
+                fs.Flush(True)
+            End Using
+        End Sub
+
+        ''' <summary>Exige que el ENTREGABLE sea, byte por byte, el archive que el sello registra. Es el
+        ''' control que corre DESPUES de cada volcado — el del pack fresco y el de la recuperacion — y
+        ''' reemplaza al <c>VerifyArchive</c> posterior al volcado, que muestreaba 3 entradas de N.
+        ''' <para>Cuesta una lectura completa del entregable. Es la misma Σ que el volcado acaba de escribir
+        ''' y la unica forma de afirmar lo que el mensaje de error afirma.</para>
+        ''' <para>⛔ "NO PUDE LEER" NO ES "QUEDO A MEDIAS", y el que las confundia era ESTE metodo. La
+        ''' lectura del entregable puede fallar por ACCESO —el antivirus escaneando el .ba2 recien
+        ''' escrito, un lector en vuelo— y esa excepcion subia cruda a los dos llamadores, que la
+        ''' reportaban como "el volcado se corto y el entregable quedo a medias" sobre un archive que
+        ''' probablemente esta perfecto. Es la misma distincion que <see cref="EsFalloTransitorio"/> ya
+        ''' aplica en <c>RecuperarVolcadoCortado</c> para el `.new`; faltaba de este lado. Nada se toco:
+        ''' el par se conserva y el reintento es gratis.</para></summary>
+        Private Shared Sub ExigirEntregableIgualAlSello(archivePath As String, newPath As String,
+                                                        registro As RegistroDeSello)
+            Dim huella As RegistroDeSello
+            Try
+                huella = HuellaDeArchivo(archivePath)
+            Catch ex As Exception When EsFalloTransitorio(ex)
+                Throw New IOException(
+                    $"no se pudo LEER '{Path.GetFileName(archivePath)}' para comprobarlo contra su sello " &
+                    "despues del volcado. El entregable NO se declara roto: no se pudo mirar. El `.new` y " &
+                    "su sello se CONSERVAN; cerra lo que tenga tomado el archive y re-empaqueta." &
+                    Environment.NewLine & ex.Message, ex)
+            End Try
+            If registro.Coincide(huella) Then Return
+            Throw New InvalidDataException(
+                $"el volcado de '{Path.GetFileName(newPath)}' sobre '{Path.GetFileName(archivePath)}' no " &
+                $"dejo el archive completo (sello: {registro}; entregable: {huella}). El `.new` y su sello " &
+                "se CONSERVAN (es la unica copia integra); re-empaqueta para que la recuperacion lo vuelva " &
+                "a intentar.")
+        End Sub
+
+        ''' <summary>True cuando el fallo es de ACCESO (alguien tiene el archivo tomado, el antivirus lo
+        ''' esta escaneando, no hubo permiso) y NO de CONTENIDO.
+        ''' <para>⛔ LA DISTINCION ES LA QUE FALTABA. Un `Catch ex As Exception` metia las dos familias en el
+        ''' mismo veredicto —<i>"el disco cambio abajo, borra los dos a mano"</i>— y un antivirus tocando el
+        ''' `.new` un segundo producia ese texto sobre un par perfectamente sano.</para>
+        ''' <para><c>FileNotFoundException</c> queda AFUERA aunque herede de <c>IOException</c>: que falte el
+        ''' archivo no es transitorio, es que el disco cambio de verdad. <c>EndOfStreamException</c> tambien
+        ''' hereda de <c>IOException</c> y tambien queda afuera: es un archivo CORTADO, o sea contenido.</para></summary>
+        Private Shared Function EsFalloTransitorio(ex As Exception) As Boolean
+            If TypeOf ex Is FileNotFoundException Then Return False
+            If TypeOf ex Is DirectoryNotFoundException Then Return False
+            If TypeOf ex Is EndOfStreamException Then Return False
+            Return TypeOf ex Is IOException OrElse TypeOf ex Is UnauthorizedAccessException
+        End Function
+
         ''' <summary>Extension de archive que le toca a cada bucket. El barrido la usa para no cruzar
         ''' juegos: un mismo Data puede tener `G.bsa` y `G - Main.ba2` bajo el mismo base name, y un pack de
         ''' FO4 no tiene por que meter mano en el archive de Skyrim.</summary>
@@ -706,36 +1051,69 @@ Namespace BethesdaArchive.Core
                 candidatos.Add(archivePath)
             Next
 
+            ' ⛔⛔ CADA ARCHIVE EN SU PROPIO Try, Y EL BARRIDO NO SE CORTA EN EL PRIMERO. Acá era
+            ' `For Each … : RecuperarVolcadoCortado(…) : Next` a secas: el primer throw abortaba el barrido
+            ' ENTERO y salía por arriba de Pack, así que los buckets sanos que venían después NUNCA se
+            ' reparaban — un `- Main.ba2` con el `.new` tomado por un antivirus dejaba al `- Textures.ba2`
+            ' truncado indefinidamente, que es exactamente el defecto #1 que este barrido vino a cerrar.
+            '
+            ' ⛔ Y AUN ASI SE ABORTA AL FINAL, con todos los fallos juntos. No se sigue de largo hacia el
+            ' censo: la razón entera de que esto corra ANTES de DiscoverSlots (ver el ⛔ del llamador) es que
+            ' el censo NO puede leer un archive sin reparar. Dejar pasar uno roto reintroduce el defecto #2
+            ' en la misma corrida. O sea: a cada bucket se le da su chance, y después se falla igual.
+            Dim fallos As New List(Of String)
             For Each archivePath In candidatos
-                RecuperarVolcadoCortado(archivePath)
+                Try
+                    RecuperarVolcadoCortado(archivePath)
+                Catch ex As Exception
+                    fallos.Add($"  · {Path.GetFileName(archivePath)}: {ex.Message}")
+                End Try
             Next
+
+            If fallos.Count > 0 Then
+                Throw New InvalidDataException(
+                    $"{fallos.Count} archive(s) del set quedaron con un volcado pendiente que no se pudo " &
+                    "resolver. Los demás SÍ se repararon." & Environment.NewLine &
+                    String.Join(Environment.NewLine, fallos))
+            End If
         End Sub
 
-        ''' <summary>El manifiesto de un archive como lista de VirtualEntry de SOLA IDENTIDAD. Es todo lo
-        ''' que VerifyArchive necesita del bundle esperado y nada mas: verificado linea por linea, consume
-        ''' `expectedBundle.Count` y `NormalizePath(ve.FullPath)` — ni tamaño, ni CRC, ni payload. Las tres
-        ''' extracciones al azar las saca del archivo mismo, no de esta lista, asi que sintetizarla no
-        ''' debilita el control.</summary>
-        Private Shared Function EsperadasDelManifiesto(reader As BethesdaReader) As List(Of VirtualEntry)
-            Dim out As New List(Of VirtualEntry)()
-            If reader.EntriesFiles Is Nothing Then Return out
-            For Each ae In reader.EntriesFiles
-                out.Add(New VirtualEntry With {.Directory = ae.Directory, .FileName = ae.FileName})
-            Next
-            Return out
-        End Function
+        ' NOTA: acá vivia `EsperadasDelManifiesto`, que sintetizaba la lista esperada A PARTIR DEL PROPIO
+        ' `.new` para dársela a `VerifyArchive`. Se fue con el sello: esa lista era justamente lo que hacia
+        ' tautológico el control (el manifiesto de un archivo verifica siempre contra si mismo, y contra
+        ' cualquier otro archivo que tenga las mismas rutas). Lo que la reemplaza es la huella del sello.
 
         ''' <summary>Recupera el volcado cortado de UN archive, o deja todo exactamente como estaba. Los
         ''' cuatro estados del par `.new`/sello:
         ''' <list type="bullet">
         ''' <item><b>sin `.new`, con sello</b> ⇒ sello huerfano, se borra;</item>
-        ''' <item><b>`.new` sin sello</b> ⇒ puede ser el de un verify FALLIDO: se descarta, no se vuelca;</item>
-        ''' <item><b>`.new` + sello</b> ⇒ se verifica el `.new`, se vuelca, se RE-VERIFICA el entregable, y
-        ''' recien ahi se limpia el par;</item>
+        ''' <item><b>`.new` sin sello, o con un sello que NO es de este formato</b> ⇒ puede ser el de un
+        ''' verify FALLIDO: se descarta, no se vuelca;</item>
+        ''' <item><b>`.new` + sello</b> ⇒ se comprueba que el `.new` ES el que el sello registra, se vuelca,
+        ''' se comprueba que el ENTREGABLE quedo igual al sello, y recien ahi se limpia el par;</item>
         ''' <item><b>ninguno</b> ⇒ no hay nada que hacer.</item></list>
-        ''' <para>⛔ EL `.new` NO SE BORRA HASTA QUE EL ENTREGABLE RE-ABRE LIMPIO. Antes se volcaba a ciegas
-        ''' —la sonda era `EntriesFiles.Count > 0`— y se borraba el par sin volver a mirar el destino: un
-        ''' volcado cortado por SEGUNDA vez se llevaba puesta la unica copia integra que quedaba.</para>
+        ''' <para>⛔ EL `.new` NO SE BORRA HASTA QUE EL ENTREGABLE ES, BYTE POR BYTE, EL QUE EL SELLO DICE.
+        ''' Antes se volcaba a ciegas —la sonda era `EntriesFiles.Count > 0`— y se borraba el par sin volver
+        ''' a mirar el destino: un volcado cortado por SEGUNDA vez se llevaba puesta la unica copia integra
+        ''' que quedaba.</para>
+        ''' <para>⛔⛔ Y DESPUES EL CONTROL SIGUIO SIENDO PROBABILISTICO. La version anterior contestaba las
+        ''' dos preguntas con `VerifyArchive`, que compara `Count` + el set de rutas y extrae 3 entradas AL
+        ''' AZAR. MEDIDO sobre los archives reales del usuario: <b>3 de 465…1.346 entradas = 0,22 %–0,65 %</b>,
+        ''' y fuera de esas 3 no lee un solo byte de ~3 GiB de payload. Dos consecuencias, las dos reales:
+        ''' <list type="bullet">
+        ''' <item><b>no distingue el archive VIEJO del NUEVO.</b> `esperadas` sale del manifiesto del `.new`
+        ''' y `VirtualEntry.FullPath` ≡ `ArchiveEntry.FullPath`, asi que un re-pack de las MISMAS rutas con
+        ''' contenido nuevo verifica IGUAL contra el `.ba2` viejo. Con el destino tomado, la corrida 2
+        ''' verificaba el viejo, pasaba, y BORRABA el par: el archive nuevo desaparecia sin un error;</item>
+        ''' <item><b>no distingue uno sano de uno CORTADO cuando el manifiesto va al frente.</b> MEDIDO: en
+        ''' BA2 la name table vive al FINAL (offset = 100,00 % del largo en los 6 archives medidos), asi que
+        ''' un `.new` truncado no abre y cae del lado seguro; pero el BSA escribe header → dir entries →
+        ''' file entries → nombres → DATA (`BSAWriter.vb:183-213, 442`), o sea manifiesto al FRENTE. Un
+        ''' `.new` de BSA cortado por la cola enumera las N rutas bien, `Count` coincide, el set coincide, y
+        ''' lo unico que puede cazarlo son las 3 extracciones: con el 90 % escrito PASA el 72,9 % de las
+        ''' veces y se volcaba el truncado encima del bueno.</item></list>
+        ''' Por eso las dos preguntas se contestan ahora contra el SELLO, que registra {largo, SHA-256}: es
+        ''' determinista y no depende de que formato ponga su manifiesto donde.</para>
         ''' <para>⛔ NO VUELVE EN SILENCIO CUANDO NO PUDO DEJAR EL ENTREGABLE VERIFICADO. El que sigue es
         ''' DiscoverSlots, que censaria ese archive a medio volcar como VACIO — o sea el defecto que esta
         ''' funcion existe para cerrar, reintroducido en la misma corrida. Falla LIMPIO y el par se
@@ -756,77 +1134,116 @@ Namespace BethesdaArchive.Core
                 Return
             End If
 
-            ' El `.new` es su propia lista esperada, y eso NO es una tautologia comoda: el sello es, por
-            ' definicion (ver donde lo escribe PackOneArchive), el registro de que la corrida muerta ya
-            ' corrio VerifyArchive(newPath, entriesToWrite) y PASO. Con el sello puesto, "manifiesto del
-            ' `.new`" ES "entriesToWrite de la corrida muerta". Lo que el verify completo agrega sobre la
-            ' sonda vieja de `Count > 0` son las tres extracciones al azar — justo lo que un `.new` cortado
-            ' no aguanta, y lo que la sonda vieja no miraba.
-            Dim esperadas As List(Of VirtualEntry) = Nothing
+            ' ⛔ UN SELLO QUE NO ES DE ESTE FORMATO NO ES UN SELLO (ver LeerSello). El vacio de 2.0.7 entra
+            ' por acá: se lo trata como el caso `.new` SIN sello, que ya esta legislado arriba. NO hay modo
+            ' legacy — creerle al sello vacio era autorizar el volcado a ciegas contra un control que mira
+            ' el 0,2 % de las entradas, que es el defecto entero.
+            Dim registro = LeerSello(selloPath)
+            If registro Is Nothing Then
+                BorrarConReintento(selloPath)
+                BorrarConReintento(newPath)
+                Return
+            End If
+
+            ' ¿El `.new` que hay en disco ES el que el sello registra? El sello es, por definicion (ver
+            ' donde lo escribe PackOneArchive), el registro de que la corrida muerta escribio ESTOS bytes,
+            ' los sincronizo y recien ahi sello. Comparar {largo, SHA-256} contesta eso y nada mas — sin
+            ' muestreo, sin depender del formato, y sin la tautologia de usar el propio `.new` como lista
+            ' esperada de si mismo.
+            Dim huellaNew As RegistroDeSello
             Try
-                Using fs = New FileStream(newPath, FileMode.Open, FileAccess.Read,
-                                          FileShare.Read Or FileShare.Delete)
-                    Using probe As New BethesdaReader(fs)
-                        esperadas = EsperadasDelManifiesto(probe)
-                    End Using
-                End Using
-                ' VerifyArchive contra una lista vacia pasa trivialmente (0 = 0, cero extracciones), asi que
-                ' el archive sin entradas se rechaza ACA, como lo hacia la sonda vieja.
-                If esperadas.Count = 0 Then Throw New InvalidDataException("archive sin entradas")
-                VerifyArchive(newPath, esperadas)
-            Catch ex As Exception
-                ' ⛔ UN `.new` SELLADO QUE HOY NO VERIFICA NO SE VUELCA NI SE BORRA. El sello dice que su
-                ' verify paso en otra corrida; si hoy no pasa, el disco cambio abajo nuestro y no sabemos
-                ' cual de los dos archivos es el sano. Es la misma ley que EscrituraEnElLugar aplica en
-                ' GuardarConCopia: sin red no se trunca.
-                Throw New InvalidDataException(
-                    $"'{Path.GetFileName(newPath)}' sello su verify en otra corrida y hoy NO verifica: el " &
-                    $"disco cambio abajo. No se vuelca sobre '{Path.GetFileName(archivePath)}' ni se borra " &
-                    "— es la unica copia. Si el problema persiste, borra los dos a mano y re-empaqueta.", ex)
+                huellaNew = HuellaDeArchivo(newPath)
+            Catch ex As Exception When EsFalloTransitorio(ex)
+                ' ⛔ TRANSITORIO NO ES SUCIO. No pude LEER el `.new` (¿el antivirus lo esta escaneando?, ¿un
+                ' lector en vuelo?). Antes esto compartia veredicto con "no verifica" y le decia al usuario
+                ' que el disco habia cambiado abajo y que borrara los dos archivos A MANO — sobre un par
+                ' perfectamente sano. Nada se toco y el reintento es gratis.
+                Throw New IOException(
+                    $"no se pudo LEER '{Path.GetFileName(newPath)}' para comprobarlo contra su sello. " &
+                    "NADA se cambio: el entregable y el par quedan como estaban. Cerra lo que tenga tomado " &
+                    $"ese archivo y re-empaqueta." & Environment.NewLine & ex.Message, ex)
             End Try
+
+            If Not registro.Coincide(huellaNew) Then
+                ' ⛔ UN `.new` SELLADO QUE HOY NO ES EL DEL SELLO NO SE VUELCA NI SE BORRA. El sello dice
+                ' que su verify paso en otra corrida; si hoy los bytes no son esos, el disco cambio abajo
+                ' nuestro y no sabemos cual de los dos archivos es el sano. Es la misma ley que
+                ' EscrituraEnElLugar aplica en GuardarConCopia: sin red no se trunca.
+                Throw New InvalidDataException(
+                    $"'{Path.GetFileName(newPath)}' no es el que su sello registra (sello: {registro}; " &
+                    $"disco: {huellaNew}): el disco cambio abajo. No se vuelca sobre " &
+                    $"'{Path.GetFileName(archivePath)}' ni se borra — es la unica copia. Si el problema " &
+                    "persiste, borra los dos a mano y re-empaqueta.")
+            End If
 
             ' ⚠️ TRAMPA VB: `Sub() tocado = True` es una ASIGNACION. En un `Function()` el MISMO texto seria
             ' una COMPARACION (devolveria un Boolean y descartaria el resultado), el flag nunca se
             ' prenderia, y todo fallo de volcado se leeria como "no toque el destino". Tiene que ser `Sub()`.
             Dim tocado As Boolean = False
+            ' Misma separacion que en PackOneArchive: "se corto escribiendo" y "no pude comprobarlo" son
+            ' dos veredictos distintos y hasta acá salian con el mismo texto.
+            Dim volcado As Boolean = False
             Try
                 ' El callback marca el instante en que el destino ya esta abierto Y truncado: a partir de
                 ' ahi, un fallo dejo el entregable destruido. CONTRATO (ver VolcarEncima): si nunca corrio y
                 ' VolcarEncima tiro, el destino esta byte-identico.
                 EscrituraEnElLugar.VolcarEncima(newPath, archivePath,
                                                 alTocarElDestino:=Sub() tocado = True)
-                ' Y el ENTREGABLE despues, con el MISMO estandar que el pack fresco: este volcado se puede
-                ' cortar a la mitad igual que el de la corrida que murio.
-                VerifyArchive(archivePath, esperadas)
+                volcado = True
+                ' Y el ENTREGABLE despues, contra el MISMO sello: este volcado se puede cortar a la mitad
+                ' igual que el de la corrida que murio.
+                ExigirEntregableIgualAlSello(archivePath, newPath, registro)
             Catch ex As Exception
+                ' El volcado TERMINO y lo que fallo fue releer el entregable: el mensaje de
+                ' ExigirEntregableIgualAlSello ya lo dice con el nombre del archivo. Se pasa tal cual.
+                If volcado AndAlso EsFalloTransitorio(ex) Then Throw
                 If Not tocado Then
                     ' El destino nunca se abrio: lo tenia un lector en vuelo, o no hubo permiso. El
                     ' entregable esta como estaba — y "como estaba" puede ser YA VOLCADO, si la corrida
                     ' muerta murio entre el volcado y la limpieza del par. Se mira el disco para saber cual
                     ' de los dos es.
                     ' (El hueco que documenta VolcarEncima —que el SetLength(0) tire y el callback no
-                    ' corra— cae igual acá: este re-verify mira el estado real, no la señal.)
+                    ' corra— cae igual acá: esto mira el estado real, no la señal.)
+                    '
+                    ' ⛔⛔ Y SE MIRA CONTRA EL SELLO, NO CONTRA EL MANIFIESTO. Acá vivia el defecto que
+                    ' borraba el archive nuevo: `VerifyArchive(archivePath, esperadas)` con `esperadas`
+                    ' sacadas del `.new` es TAUTOLOGICO cuando el set de rutas no cambio, asi que el
+                    ' `.ba2` VIEJO pasaba, se daba el volcado por hecho y se borraba el par.
+                    Dim yaEstaba As Boolean
                     Try
-                        VerifyArchive(archivePath, esperadas)
-                    Catch
+                        yaEstaba = registro.Coincide(HuellaDeArchivo(archivePath))
+                    Catch exLect As Exception When EsFalloTransitorio(exLect)
+                        Throw New IOException(
+                            $"no se pudo comprometer '{Path.GetFileName(newPath)}' sobre " &
+                            $"'{Path.GetFileName(archivePath)}': el destino no se pudo abrir NI leer para " &
+                            "saber si el volcado ya estaba hecho. NADA se cambio y el par se CONSERVA; " &
+                            "cerra lo que tenga tomado el archive y re-empaqueta." &
+                            Environment.NewLine & exLect.Message, ex)
+                    End Try
+                    If Not yaEstaba Then
                         Throw New InvalidDataException(
                             $"no se pudo comprometer '{Path.GetFileName(newPath)}' sobre " &
                             $"'{Path.GetFileName(archivePath)}': el destino no se pudo abrir (¿un lector en " &
-                            "vuelo?) y lo que hay en disco no verifica. El `.new` y su sello se CONSERVAN " &
-                            "(es la unica copia integra); cerra lo que tenga tomado el archive y re-empaqueta.", ex)
-                    End Try
-                    ' Verifica contra el manifiesto del `.new`: el volcado YA estaba hecho y lo unico que
-                    ' faltaba era limpiar el par. Se limpia abajo y se sigue.
+                            "vuelo?) y lo que hay en disco NO es el archive nuevo. El `.new` y su sello se " &
+                            "CONSERVAN (es la unica copia integra); cerra lo que tenga tomado el archive y " &
+                            "re-empaqueta.", ex)
+                    End If
+                    ' El entregable ES, byte por byte, el que el sello registra: el volcado YA estaba hecho
+                    ' y lo unico que faltaba era limpiar el par. Se limpia abajo y se sigue.
                 Else
                     ' ⛔ EL PAR SE CONSERVA. El destino se abrio y se trunco, asi que el entregable esta
                     ' destruido: el `.new` es la unica copia integra del archive nuevo y borrarlo deja al
-                    ' usuario sin nada para volver. No se re-verifica: ya sabemos que esta roto, y un
-                    ' verify de mas solo cambiaria el mensaje.
+                    ' usuario sin nada para volver.
+                    ' Dos caminos caen acá y los dos dejan el mismo estado: que `VolcarEncima` tirara a
+                    ' mitad de la copia, o que el entregable resultante NO coincida con el sello. El
+                    ' `ex.Message` va EMBEBIDO (patron de FomodExporter) porque los dialogos muestran solo
+                    ' `.Message`: sin eso el usuario no ve cual de los dos fue ni las dos huellas.
                     Throw New InvalidDataException(
                         $"el volcado de '{Path.GetFileName(newPath)}' sobre " &
-                        $"'{Path.GetFileName(archivePath)}' se corto DESPUES de empezar a escribir: el " &
-                        "entregable quedo a medias. El `.new` y su sello se CONSERVAN (es la unica copia " &
-                        "integra); re-empaqueta para que la recuperacion lo vuelva a intentar.", ex)
+                        $"'{Path.GetFileName(archivePath)}' no dejo el archive completo: el entregable " &
+                        "quedo a medias. El `.new` y su sello se CONSERVAN (es la unica copia integra); " &
+                        "re-empaqueta para que la recuperacion lo vuelva a intentar." &
+                        Environment.NewLine & ex.Message, ex)
                 End If
             End Try
 
@@ -895,10 +1312,16 @@ Namespace BethesdaArchive.Core
             ' lo que tarda. Si aun asi no se puede, esto falla LIMPIO: el original queda intacto y el
             ' `.new` tambien, y el usuario reintenta el pack.
             Dim newPath = archivePath & ".new"
-            BorrarConReintento(newPath)
-            ' ⛔ Y el sello TAMBIEN: un ciclo nuevo no puede heredar el sello de otro. Si quedara, este
-            ' `.new` —que todavia no verifico nada— pasaria por verificado ante la corrida siguiente.
+            ' ⛔ EL SELLO PRIMERO, EL `.new` DESPUES — el MISMO orden que la limpieza del final y que
+            ' RecuperarVolcadoCortado, y por la misma razon: son DOS borrados, no uno atomico, y
+            ' BorrarConReintento TIRA. Si el par se corta a la mitad, lo que tiene que sobrevivir es un
+            ' `.new` huerfano (que la corrida siguiente DESCARTA), nunca un SELLO huerfano (que emparejaria
+            ' con el `.new` de este mismo ciclo y lo haria pasar por verificado sin que nadie lo
+            ' verificara). Acá el orden estaba al reves. Hoy es inocuo —el `.new` que se acaba de borrar es
+            ' justo el que ese sello describia— pero el orden de estos dos borrados es UNA ley, y tenerla
+            ' escrita en un lugar y aplicada al reves en otro es como se pierde.
             BorrarConReintento(newPath & SUFIJO_SELLO)
+            BorrarConReintento(newPath)
 
             Try
                 ' El reader del ORIGINAL (y su FileStream) tiene que seguir abierto mientras corre
@@ -931,17 +1354,72 @@ Namespace BethesdaArchive.Core
                 ' (bundle ∪ preserved), not just the bundle — otherwise preserved entries would be
                 ' counted as "extra" and verification would fail.
                 VerifyArchive(newPath, entriesToWrite)
-                ' Sello: recien con el verify PASADO el `.new` es una copia que se puede volcar a ciegas.
-                ' Sin esto, un `.new` que quedo de un verify FALLIDO (p. ej. una entrada que extrae vacia)
-                ' lo levantaba la corrida siguiente y lo comprometia encima del archive bueno.
-                File.WriteAllBytes(newPath & SUFIJO_SELLO, Array.Empty(Of Byte)())
 
-                EscrituraEnElLugar.VolcarEncima(newPath, archivePath)
+                ' ⛔⛔ EL ORDEN DE ESTAS TRES LINEAS ES LA LEY DE DURABILIDAD, Y ANTES NO EXISTIA NINGUNA.
+                ' En todo el camino de pack no habia UN SOLO FlushFileBuffers: `WriteArchive` es
+                ' `File.Create` + `Dispose` (cerrar NO sincroniza) y el sello era
+                ' `File.WriteAllBytes(..., Array.Empty)` — CERO BYTES, o sea un sello que no registraba
+                ' nada y solo podia decir "existo". La ley que eso viola ya estaba escrita y ratificada en
+                ' `EscrituraEnElLugar` ("cerrar NO sincroniza… un corte de luz se los lleva aunque el
+                ' guardado haya dicho que salio bien" / "la red solo es red si llego al plato"), y este
+                ' `.new` es lo unico del arbol que se declara "la unica copia integra" TRES VECES y no se
+                ' sincronizaba.
+                '   1. el `.new` al PLATO. Si esto falla, no hay sello: no se puede afirmar lo que el sello
+                '      afirma, asi que no se afirma.
+                '   2. su huella {largo, SHA-256}: lo que convierte al sello en un REGISTRO y no en una
+                '      marca. Es lo que despues deja contestar de forma determinista "¿este `.new` es el
+                '      que se verifico?" y "¿el entregable YA es ese `.new`?" — las dos preguntas que se
+                '      contestaban muestreando 3 entradas de hasta 1.346 (0,22 %).
+                '   3. el sello al plato, DESPUES del `.new`. Al reves el par vuelve a mentir.
+                SincronizarArchivo(newPath)
+                Dim registro = HuellaDeArchivo(newPath)
+                EscribirSelloSincronizado(newPath & SUFIJO_SELLO, registro)
 
-                ' Y el ENTREGABLE despues: el volcado puede cortarse a la mitad.
-                VerifyArchive(archivePath, entriesToWrite)
+                ' ⛔ `alTocarElDestino` TAMBIEN ACA. Esta llamada era `VolcarEncima(newPath, archivePath)`
+                ' pelada mientras la de RecuperarVolcadoCortado si pasaba el callback: la misma operacion,
+                ' con dos fidelidades distintas. Sin el, el `Catch` de abajo no puede distinguir "no pude ni
+                ' abrir el archive" (entregable INTACTO) de "lo rompi a la mitad", y el usuario recibe el
+                ' IOException crudo del kernel, que no dice ninguna de las dos cosas.
+                ' ⚠️ TRAMPA VB: tiene que ser `Sub()`. En un `Function()` el mismo texto seria una
+                ' COMPARACION, el flag no se prenderia nunca y todo fallo se leeria como "no toque nada".
+                Dim destinoTocado As Boolean = False
+                ' ⛔ Y ESTE SEGUNDO FLAG SEPARA "SE CORTO ESCRIBIENDO" DE "NO PUDE COMPROBARLO". Sin el, un
+                ' fallo de LECTURA del entregable (el antivirus escaneando el .ba2 recien volcado) salia
+                ' con el texto de "quedo a medias" sobre un archive completo, y eso manda al usuario a
+                ' pisar un entregable sano. Mismo `Sub()` obligatorio que arriba: en un `Function()` seria
+                ' una comparacion.
+                Dim volcadoCompleto As Boolean = False
+                Try
+                    EscrituraEnElLugar.VolcarEncima(newPath, archivePath,
+                                                    alTocarElDestino:=Sub() destinoTocado = True)
+                    volcadoCompleto = True
+                    ' Y el ENTREGABLE despues, contra el sello: el volcado puede cortarse a la mitad.
+                    ExigirEntregableIgualAlSello(archivePath, newPath, registro)
+                Catch ex As Exception
+                    If volcadoCompleto AndAlso EsFalloTransitorio(ex) Then
+                        ' El volcado TERMINO; lo que fallo fue volver a LEER el entregable para
+                        ' comprobarlo. ExigirEntregableIgualAlSello ya dice exactamente eso y nombra el
+                        ' archivo: se pasa tal cual, sin re-etiquetarlo de "a medias".
+                        Throw
+                    End If
+                    If Not destinoTocado Then
+                        ' CONTRATO de VolcarEncima: el callback nunca corrio ⇒ el destino esta
+                        ' byte-identico a como estaba. No se le dice al usuario que quedo a medias, que lo
+                        ' mandaria a pisar un archive BUENO.
+                        Throw New InvalidDataException(
+                            $"'{Path.GetFileName(archivePath)}' NO se modifico: el archive no se pudo abrir " &
+                            "para escribir (¿un lector en vuelo?, ¿el juego abierto?). Tu archive esta " &
+                            "INTACTO y el `.new` con su sello se CONSERVAN; cerra lo que lo tenga tomado y " &
+                            "re-empaqueta." & Environment.NewLine & ex.Message, ex)
+                    End If
+                    Throw New InvalidDataException(
+                        $"el volcado sobre '{Path.GetFileName(archivePath)}' se corto DESPUES de empezar a " &
+                        "escribir: el entregable quedo a medias. El `.new` y su sello se CONSERVAN (es la " &
+                        "unica copia integra); re-empaqueta para que la recuperacion lo vuelva a intentar." &
+                        Environment.NewLine & ex.Message, ex)
+                End Try
 
-                ' El archive ya esta volcado Y verificado: a partir de aca el pack es un exito.
+                ' El archive ya esta volcado Y comprobado contra el sello: a partir de aca el pack es un exito.
                 result.Archives.Add(archivePath)
                 ' La limpieza es cosmetica y va DESPUES, en su propio Try: BorrarConReintento TIRA a los 5
                 ' intentos, y un antivirus escaneando el sello de 0 bytes recien creado convertia un pack
@@ -1177,12 +1655,14 @@ Namespace BethesdaArchive.Core
         End Function
 
         ' --------------------------------------------------------------------------------------
-        ' Build the entry list to feed the writer:
-        '   - paths in diff.UnchangedPaths → wrap bundle entry with pass-through bytes from .bak.
+        ' Build the entry list to feed the writer. La FUENTE pass-through es el archive ORIGINAL, abierto
+        ' para lectura en su lugar mientras se escribe el `.new` (ver PackOneArchive) — NO un `.bak`: ese
+        ' rename se fue en 2.0.5 y con el el archivo intermedio.
+        '   - paths in diff.UnchangedPaths → wrap bundle entry with pass-through bytes from the original.
         '   - paths that are added or changed → forward the bundle entry as-is (writer compresses).
-        '   - paths in diff.PreservePaths (existing in .bak but NOT in the bundle) → emit pass-through
-        '     entry from .bak so the rewritten archive keeps everything that was already there.
-        '     This is what makes Pack a merge ("upsert") instead of a destructive replace.
+        '   - paths in diff.PreservePaths (existing in the original but NOT in the bundle) → emit
+        '     pass-through entry from the original so the rewritten archive keeps everything that was
+        '     already there. This is what makes Pack a merge ("upsert") instead of a destructive replace.
         '
         ' BA2-014 — single-chunk-only DX10 pass-through limitation:
         '   Stream-copy pass-through (BuildPassThroughEntry) only works for entries the reader can
@@ -1196,7 +1676,7 @@ Namespace BethesdaArchive.Core
         '     - UNCHANGED bundle entry: ComputeDiff's ExtractCompressedPayload throws → caught as
         '       "changed" → the entry is forwarded as the bundle's own VirtualEntry and the DX10
         '       writer RECOMPRESSES it as a single chunk. Never a verbatim copy.
-        '     - PRESERVED entry (in .bak, not in the bundle): PassThroughCodecSafe → GetPayloadSource
+        '     - PRESERVED entry (in the original, not in the bundle): PassThroughCodecSafe → GetPayloadSource
         '       throws NotSupportedException, and the BuildRecompressEntry fallback ALSO calls
         '       ExtractCompressedPayload, which throws too. So a multi-chunk DX10 preserve-path entry
         '       would surface a hard error (rolled back by PackOneArchive), not a silent recompress.
@@ -1206,12 +1686,12 @@ Namespace BethesdaArchive.Core
         '   must add a multi-chunk extract+recompress path before relying on pass-through.
         ' --------------------------------------------------------------------------------------
         Private Shared Function BuildEntriesToWrite(bundle As List(Of VirtualEntry),
-                                                    bakReader As BethesdaReader,
+                                                    origenReader As BethesdaReader,
                                                     diff As DiffResult,
                                                     kind As BucketKind) As List(Of VirtualEntry)
-            Dim bakByPath As New Dictionary(Of String, ArchiveEntry)(StringComparer.OrdinalIgnoreCase)
-            For Each ae In bakReader.EntriesFiles
-                bakByPath(NormalizePath(ae.FullPath)) = ae
+            Dim origenPorRuta As New Dictionary(Of String, ArchiveEntry)(StringComparer.OrdinalIgnoreCase)
+            For Each ae In origenReader.EntriesFiles
+                origenPorRuta(NormalizePath(ae.FullPath)) = ae
             Next
 
             Dim targetCodec As PayloadCodec = TargetCodecFor(kind)
@@ -1220,14 +1700,14 @@ Namespace BethesdaArchive.Core
             ' First: bundle entries (each one keeps its order; unchanged ones get pass-through).
             For Each ve In bundle
                 Dim p = NormalizePath(ve.FullPath)
-                Dim bakAe As ArchiveEntry = Nothing
-                If diff.UnchangedPaths.Contains(p) AndAlso bakByPath.TryGetValue(p, bakAe) Then
-                    ' Pass-through is byte-correct only when the .bak's codec matches the target.
+                Dim origenAe As ArchiveEntry = Nothing
+                If diff.UnchangedPaths.Contains(p) AndAlso origenPorRuta.TryGetValue(p, origenAe) Then
+                    ' Pass-through is byte-correct only when the ORIGINAL's codec matches the target.
                     ' On a codec mismatch (e.g. a v3/LZ4 source rewritten as v8/Zlib) a verbatim
                     ' stream-copy would corrupt the entry, so fall back to the bundle entry as-is
                     ' and let the writer recompress with the target codec.
-                    If PassThroughCodecSafe(bakReader, bakAe.Index, targetCodec) Then
-                        out.Add(BuildPassThroughEntry(ve.Directory, ve.FileName, ve.PreferCompress, ve.Crc32, bakReader, bakAe.Index))
+                    If PassThroughCodecSafe(origenReader, origenAe.Index, targetCodec) Then
+                        out.Add(BuildPassThroughEntry(ve.Directory, ve.FileName, ve.PreferCompress, ve.Crc32, origenReader, origenAe.Index))
                     Else
                         out.Add(ve)
                     End If
@@ -1236,16 +1716,16 @@ Namespace BethesdaArchive.Core
                 End If
             Next
 
-            ' Then: preserved entries (existing in .bak, not in the bundle). Pass-through when the
-            ' codec matches; otherwise recompress from the .bak's decompressed payload (the bundle
+            ' Then: preserved entries (existing in the original, not in the bundle). Pass-through when the
+            ' codec matches; otherwise recompress from the ORIGINAL's decompressed payload (the bundle
             ' has no copy of these, so we must re-extract them to re-encode safely).
             For Each pp In diff.PreservePaths
-                Dim bakAe As ArchiveEntry = Nothing
-                If Not bakByPath.TryGetValue(pp, bakAe) Then Continue For
-                If PassThroughCodecSafe(bakReader, bakAe.Index, targetCodec) Then
-                    out.Add(BuildPassThroughEntry(bakAe.Directory, bakAe.FileName, False, 0UI, bakReader, bakAe.Index))
+                Dim origenAe As ArchiveEntry = Nothing
+                If Not origenPorRuta.TryGetValue(pp, origenAe) Then Continue For
+                If PassThroughCodecSafe(origenReader, origenAe.Index, targetCodec) Then
+                    out.Add(BuildPassThroughEntry(origenAe.Directory, origenAe.FileName, False, 0UI, origenReader, origenAe.Index))
                 Else
-                    out.Add(BuildRecompressEntry(bakAe.Directory, bakAe.FileName, bakReader, bakAe.Index))
+                    out.Add(BuildRecompressEntry(origenAe.Directory, origenAe.FileName, origenReader, origenAe.Index))
                 End If
             Next
 
@@ -1266,8 +1746,8 @@ Namespace BethesdaArchive.Core
         ' A stream-copy is byte-correct only when the source payload is either stored (no codec)
         ' or encoded with the SAME codec the destination archive will declare. Anything else would
         ' silently corrupt the entry, so we refuse and let the caller recompress instead.
-        Private Shared Function PassThroughCodecSafe(bakReader As BethesdaReader, bakIndex As Integer, targetCodec As PayloadCodec) As Boolean
-            Dim ps = bakReader.GetPayloadSource(bakIndex)
+        Private Shared Function PassThroughCodecSafe(origenReader As BethesdaReader, origenIndex As Integer, targetCodec As PayloadCodec) As Boolean
+            Dim ps = origenReader.GetPayloadSource(origenIndex)
             If Not ps.IsCompressed Then Return True               ' stored raw → always copy-safe
             Return ps.SourceCodec = targetCodec
         End Function
@@ -1276,13 +1756,13 @@ Namespace BethesdaArchive.Core
                                                        fileName As String,
                                                        preferCompress As Boolean,
                                                        crc32 As UInteger,
-                                                       bakReader As BethesdaReader,
-                                                       bakIndex As Integer) As VirtualEntry
+                                                       origenReader As BethesdaReader,
+                                                       origenIndex As Integer) As VirtualEntry
             ' Stream-copy pass-through: the writer seeks PayloadSource.SourceStream and copies
             ' Length bytes directly into the output without ever materializing the payload in
             ' a managed array. RAM peak per entry is O(64 KB) regardless of file size, which is
             ' the difference between minutes and hours on multi-GB archive rewrites.
-            Dim ps = bakReader.GetPayloadSource(bakIndex)
+            Dim ps = origenReader.GetPayloadSource(origenIndex)
             Dim ve As New VirtualEntry With {
                 .Directory = dir,
                 .FileName = fileName,
@@ -1301,7 +1781,7 @@ Namespace BethesdaArchive.Core
             Return ve
         End Function
 
-        ' Codec-mismatch fallback for a PRESERVED entry (one that exists only in .bak, with no
+        ' Codec-mismatch fallback for a PRESERVED entry (one that exists only in the ORIGINAL, with no
         ' bundle copy to forward). We extract the entry's raw stored chunk, decompress it to the
         ' stripped/decompressed payload, and hand that to the writer as plain Data so it recompresses
         ' with the target codec. RawCompressedEntry.Bytes decodes to the exact stripped payload for
@@ -1309,9 +1789,9 @@ Namespace BethesdaArchive.Core
         ' expect on the non-pass-through branch.
         Private Shared Function BuildRecompressEntry(dir As String,
                                                       fileName As String,
-                                                      bakReader As BethesdaReader,
-                                                      bakIndex As Integer) As VirtualEntry
-            Dim raw = bakReader.ExtractCompressedPayload(bakIndex)
+                                                      origenReader As BethesdaReader,
+                                                      origenIndex As Integer) As VirtualEntry
+            Dim raw = origenReader.ExtractCompressedPayload(origenIndex)
             Dim payload As Byte()
             If raw.IsCompressed Then
                 ' Source codec is non-target (that's why we're here). The strict decoders detect
@@ -1346,6 +1826,14 @@ Namespace BethesdaArchive.Core
         ' --------------------------------------------------------------------------------------
         ' Writer dispatch by bucket. Options use library defaults — Pack does not expose them yet.
         ' --------------------------------------------------------------------------------------
+        ''' <summary>⛔ CIERRA CON <c>Flush(True)</c>, y no es decorativo. `File.Create` + `Dispose` deja los
+        ''' bytes en la cache del sistema: es la misma trampa que <c>EscrituraEnElLugar</c> documenta en su
+        ''' nucleo (<i>"cerrar NO sincroniza"</i>). Acá el archivo que se escribe es, o el `.new` que la
+        ''' corrida siguiente va a tratar como la unica copia integra, o el archive fresco que ya es el
+        ''' entregable; en los dos casos hay algo que despues AFIRMA que esos bytes estan.
+        ''' <para>El costo es POR LLAMADA, no por byte (medido en <c>EscrituraEnElLugar.Escribir</c>:
+        ''' +2,66 a +4,53 ms), y acá es UNA llamada por archive reescrito — no por entrada. Frente a los
+        ''' ~3 GiB que la misma llamada acaba de mover, es ruido.</para></summary>
         Private Shared Sub WriteArchive(path As String, entries As List(Of VirtualEntry), kind As BucketKind, ba2Version As UInteger)
             Using fs As FileStream = File.Create(path)
                 Select Case kind
@@ -1358,6 +1846,7 @@ Namespace BethesdaArchive.Core
                     Case Else
                         Throw New ArgumentOutOfRangeException(NameOf(kind))
                 End Select
+                fs.Flush(True)
             End Using
         End Sub
 
@@ -1403,6 +1892,35 @@ Namespace BethesdaArchive.Core
             End Using
         End Sub
 
+        ''' <summary>True si <paramref name="path"/> existe y su contenido es, byte por byte,
+        ''' <paramref name="esperado"/>. Corta por tamaño primero.
+        ''' <para>No es <c>EscrituraEnElLugar.MismoContenido</c> con otro nombre: aquella compara DOS
+        ''' ARCHIVOS y esta compara un archivo contra bytes que ya están en RAM (la entrada recién extraída),
+        ''' así que no hay una segunda lectura que ahorrar ni una ley que duplicar.</para>
+        ''' <para>Ante cualquier fallo devuelve False: "no pude probar que son iguales" tiene que caer del
+        ''' lado de respaldar y escribir, nunca del lado de saltear.</para></summary>
+        Private Shared Function MismosBytes(path As String, esperado As Byte()) As Boolean
+            Try
+                Dim fi As New FileInfo(path)
+                If Not fi.Exists OrElse fi.Length <> esperado.LongLength Then Return False
+                Using fs = File.OpenRead(path)
+                    Dim buf(65535) As Byte
+                    Dim pos As Integer = 0
+                    While pos < esperado.Length
+                        Dim n = fs.Read(buf, 0, Math.Min(buf.Length, esperado.Length - pos))
+                        If n <= 0 Then Return False
+                        For i = 0 To n - 1
+                            If buf(i) <> esperado(pos + i) Then Return False
+                        Next
+                        pos += n
+                    End While
+                    Return True
+                End Using
+            Catch
+                Return False
+            End Try
+        End Function
+
         Private Shared Function IsTextureEntry(ve As VirtualEntry) As Boolean
             Dim ext = IO.Path.GetExtension(If(ve.FileName, "")).ToLowerInvariant()
             Return ext = ".dds"
@@ -1427,6 +1945,8 @@ Namespace BethesdaArchive.Core
         ''' Enumerates archives and plugins under outputDir whose file name starts with modBaseName.
         ''' Used by Unpack to drive cleanup and by callers who want to inspect the current pack
         ''' state before deciding what to do.
+        ''' <para>Además llena <see cref="ArchiveSetInfo.Huerfanos"/>: archivos que acompañan al set y que
+        ''' ningún camino del packer consume ni borra. NO se borra nada — ver el ⛔ de esa propiedad.</para>
         ''' </summary>
         Public Shared Function DiscoverArchiveSet(outputDir As String, modBaseName As String) As ArchiveSetInfo
             If String.IsNullOrWhiteSpace(outputDir) Then Throw New ArgumentException("outputDir is empty.", NameOf(outputDir))
@@ -1450,8 +1970,33 @@ Namespace BethesdaArchive.Core
                 Next
             Next
 
+            ' --- Huérfanos: se REPORTAN, no se tocan --------------------------------------------------
+            ' ⛔ ESTOS NO LOS VE NADIE MAS. El filtro de arriba pide que el nombre TERMINE en una de las 5
+            ' extensiones, asi que un `WM_ClonePack3 - Textures.ba2.bak` (extension efectiva `.bak`) queda
+            ' fuera del censo, fuera del barrido de recuperacion y fuera del Unpack: son hasta 3 GiB por
+            ' pieza que no borra nadie. Los dejo el rename de 2.0.2, que ya no existe, junto con el
+            ' `BorrarConReintento(bakPath)` que era su unico barrendero.
+            ' MEDIDO al escribir esto: 0 en el Data de FO4 del usuario (61 `WM_ClonePack*` sanos, 89,87 GiB)
+            ' y 0 en el de SSE ⇒ el defecto es LATENTE acá; a quien le pega es al que viene de 2.0.2.
+            ' Los `.new`/`.ok` NO entran: esos SI tienen dueño (RecuperarVolcadosCortados) y borrarlos o
+            ' reportarlos como basura seria pisar el protocolo de recuperacion.
+            ' Los `.bak.unpack` TAMPOCO entran acá y no es un olvido: viven bajo `LooseDataDir` con el
+            ' nombre del SUELTO, no bajo `OutputDir` con el prefijo del mod, asi que este barrido no los
+            ' puede ver. Los reporta `Unpack`, que es quien conoce esa carpeta.
+            For Each sufijo In New String() {".ba2.bak", ".bsa.bak"}
+                For Each filePath In Directory.EnumerateFiles(outputDir, modBaseName & "*" & sufijo, SearchOption.TopDirectoryOnly)
+                    ' El stem contra el que se valida es el del ARCHIVE, o sea el nombre sin el sufijo
+                    ' huerfano: "WM_ClonePack3 - Textures.ba2.bak" → "WM_ClonePack3 - Textures".
+                    Dim nombre = Path.GetFileName(filePath)
+                    Dim stemArchive = nombre.Substring(0, nombre.Length - sufijo.Length)
+                    If Not BelongsToModBaseName(stemArchive, modBaseName) Then Continue For
+                    info.Huerfanos.Add(filePath)
+                Next
+            Next
+
             info.Archives.Sort(StringComparer.OrdinalIgnoreCase)
             info.Plugins.Sort(StringComparer.OrdinalIgnoreCase)
+            info.Huerfanos.Sort(StringComparer.OrdinalIgnoreCase)
             Return info
         End Function
 
@@ -1495,9 +2040,35 @@ Namespace BethesdaArchive.Core
         ''' written loose files stay on disk, archives are NOT deleted (phase 2 only runs on full
         ''' success). The caller can re-run Unpack to finish the job.
         '''
-        ''' Failure mode: extraction errors abort BEFORE any deletion happens. Already-written loose
-        ''' files remain on disk; the caller decides whether to roll them back. Per-archive deletion
-        ''' is best-effort once all extractions succeeded.
+        ''' ⛔ MODO DE FALLO — CAMBIO DE CONTRATO DECLARADO (antes: "extraction errors abort BEFORE any
+        ''' deletion happens"). Un fallo escribiendo UNA entrada ya no aborta la corrida: se anota en
+        ''' <see cref="UnpackResult.Fallos"/>, ese archive queda marcado como NO extraído del todo (y por lo
+        ''' tanto NO se borra), y el Unpack sigue con las demás entradas y los demás archives. Al final, si
+        ''' hubo algún fallo, se tira UNA excepción que los enumera.
+        ''' <para>Por qué: la escritura del suelto era <c>File.WriteAllBytes</c>, que sobre un destino
+        ''' OCULTO o de SOLO LECTURA tira <c>UnauthorizedAccessException</c> (MEDIDO). Con el abort en el
+        ''' primero, un solo suelto oculto —los deja OneDrive y cualquier desempaquetador— rompía el Unpack
+        ''' ENTERO, y el re-intento volvía a chocar contra el mismo archivo: quedaba roto para siempre.
+        ''' La condición de borrado NO se relaja ni un milímetro: ningún archive con una entrada fallada se
+        ''' borra, así que nada se pierde y un re-run sigue donde quedó.</para>
+        ''' <para>⛔ LA ESCRITURA VA EN EL LUGAR, por <c>EscrituraEnElLugar</c>. <c>WriteAllBytes</c> pide
+        ''' CREATE_ALWAYS y eso muere sobre un archivo oculto; <c>OpenOrCreate</c> + <c>SetLength(0)</c>
+        ''' escribe igual, CONSERVA el atributo y —lo que importa bajo los gestores de mods— deja el suelto
+        ''' adentro de SU mod en vez de mandarlo a <c>overwrite</c>. La ley y su medición viven en
+        ''' <c>EscrituraEnElLugar</c> y en <c>Wardrobe_Manager\OSP_Clases.vb</c>; acá no se escribe una
+        ''' segunda. SOLO LECTURA sigue siendo un fallo duro y a propósito: sacarle el atributo a un archivo
+        ''' del usuario sería una ley nueva, y esa no la inventa el packer.</para>
+        ''' <para>⛔ QUÉ ES EL <c>.bak.unpack</c>, dicho de una vez porque el código y los comentarios decían
+        ''' cosas distintas: es el suelto del usuario que este Unpack está por PISAR, guardado aparte, y se
+        ''' queda en disco hasta que él lo borre. No lo consume nadie y eso es DELIBERADO — es retención,
+        ''' exactamente la misma postura y el mismo costo declarado que la copia heredada de
+        ''' <c>GuardarConCopia</c>. Dos comentarios decían "renamed" y el código copiaba desde 2.0.5; ahora
+        ''' dicen lo que pasa.</para>
+        ''' <para>⛔ Y VA AL PRIMER SLOT LIBRE. El nombre era FIJO y la copia iba con <c>overwrite:=True</c>:
+        ''' un segundo Unpack DESTRUÍA el respaldo del primero. Es el mismo defecto que la ley del slot ya
+        ''' cierra en <c>GuardarConCopia</c>, así que se usa esa misma ley (<c>PrimerSlotLibre</c>) y no una
+        ''' segunda. ⛔ Lo que NO se usa es <c>GuardarConCopia</c> entera: esa BORRA su copia al salir bien
+        ''' —es red de crash, no retención— y habría convertido este respaldo en pérdida de datos.</para>
         ''' </summary>
         Public Shared Function Unpack(req As UnpackRequest,
                                        Optional onEntry As Action(Of Integer, Integer, String) = Nothing,
@@ -1544,8 +2115,8 @@ Namespace BethesdaArchive.Core
             ' all of its entries were successfully written to loose. This bounds disk peak to
             ' "one archive worth of duplicated bytes" instead of the entire packed set, while
             ' staying recoverable: if extraction fails or is cancelled mid-archive, that archive
-            ' stays on disk and a re-run of Unpack picks up where it left off (already-extracted
-            ' loose files get renamed to *.bak.unpack — no data loss).
+            ' stays on disk and a re-run of Unpack picks up where it left off (un suelto que ya
+            ' existía y no era nuestro queda respaldado en `<suelto>.bak.unpack` — no data loss).
             Dim archiveIndex As Integer = 0
             For Each archivePath In info.Archives
                 If ct.IsCancellationRequested Then
@@ -1570,40 +2141,140 @@ Namespace BethesdaArchive.Core
 
                                 Dim relPath = entry.FullPath
                                 Dim outPath = Path.Combine(req.LooseDataDir, relPath)
-                                EnsureDir(outPath)
 
-                                Dim bytes = reader.ExtractToMemory(entry.Index)
-                                If bytes Is Nothing Then bytes = Array.Empty(Of Byte)()
+                                ' ⛔⛔ EL `Try` EMPIEZA ACA, Y ANTES EMPEZABA TRES SENTENCIAS MAS ABAJO.
+                                ' `EnsureDir` y `ExtractToMemory` —las dos que tocan el disco y el
+                                ' payload— quedaban AFUERA, asi que su excepcion caia al `Catch` de
+                                ' ARCHIVE y se llevaba puesto el SET entero: exactamente el
+                                ' "roto para siempre" que el ⛔ del docstring de Unpack declara CERRADO,
+                                ' vivo por una puerta que la ley no cubria. Y el mensaje nombraba el
+                                ' ARCHIVE, no la entrada, o sea que el usuario no sabia que arreglar.
+                                ' Los disparadores son reales y son tres, todos por la misma puerta: el
+                                ' directorio de destino ocupado por un ARCHIVO, la ruta de mas de 260
+                                ' caracteres, y el payload corrupto que hace tirar a ExtractToMemory.
+                                ' El `Catch` de abajo ya pone `archiveFullyExtracted = False`, que es lo
+                                ' que impide el borrado del archive: la entrada falla sola, el archive se
+                                ' conserva, y el re-run sigue donde quedo. Gate: UnpackSueltosGate U9.
+                                Try
+                                    EnsureDir(outPath)
 
-                                ' Preserve any existing loose file that wasn't ours by renaming it.
-                                ' Caller post-processes "*.bak.unpack" if it cares about conflicts.
-                                ' ⛔ Se COPIA, no se mueve. El `File.Move(outPath, …)` que habia aca sacaba
-                                ' el suelto del arbol virtual de Mod Organizer —o sea, del mod que lo
-                                ' aporta— y entonces el WriteAllBytes de mas abajo escribia un archivo
-                                ' NUEVO, que cae en `overwrite`. Con la copia, el suelto original queda
-                                ' preservado en el `.bak.unpack` y el destino se sobrescribe EN EL LUGAR.
-                                If File.Exists(outPath) Then
-                                    Dim conflictBak = outPath & ".bak.unpack"
-                                    File.Copy(outPath, conflictBak, True)
-                                End If
+                                    Dim bytes = reader.ExtractToMemory(entry.Index)
+                                    If bytes Is Nothing Then bytes = Array.Empty(Of Byte)()
 
-                                ' ⛔ UN EXTRACT VACIO NO HABILITA EL BORRADO DEL ARCHIVE. `ExtractToMemory`
-                                ' de una entrada DX10 devuelve 0 bytes si el wrapper nativo no carga; sin
-                                ' esto se escribia un .dds vacio por textura y despues se borraba el .ba2,
-                                ' que era la unica copia. Se sigue escribiendo lo que haya (el resto del
-                                ' unpack es util) pero el archive NO se borra.
-                                If bytes.Length = 0 Then archiveFullyExtracted = False
-                                File.WriteAllBytes(outPath, bytes)
-                                result.LooseFilesWritten.Add(outPath)
+                                    ' Respaldos de corridas ANTERIORES: se REPORTAN y no se tocan.
+                                    ' ⛔ SE MIRAN TODOS LOS SLOTS, no solo el primero. Desde que el nombre sale
+                                    ' de `PrimerSlotLibre` los respaldos son `.bak.unpack`, `…2`, `…3`…, y un
+                                    ' reporte que mirara solo el slot 1 SUBCONTARIA justo en el caso que este
+                                    ' cambio hizo posible (varias corridas). Se corta en el primer hueco, que es
+                                    ' la MISMA regla con la que `PrimerSlotLibre` decide que slot esta ocupado:
+                                    ' dos reglas distintas sobre los mismos nombres es como se empieza a
+                                    ' reportar una cosa y a pisar otra.
+                                    Dim slotBak As Integer = 1
+                                    Do
+                                        Dim bakViejo = outPath & SUFIJO_BAK_UNPACK &
+                                                       If(slotBak = 1, "", slotBak.ToString(Globalization.CultureInfo.InvariantCulture))
+                                        If Not File.Exists(bakViejo) Then Exit Do
+                                        result.Huerfanos.Add(bakViejo)
+                                        slotBak += 1
+                                    Loop
+
+                                    ' ⛔ UN EXTRACT VACIO NO HABILITA EL BORRADO DEL ARCHIVE. `ExtractToMemory`
+                                    ' de una entrada DX10 devuelve 0 bytes si el wrapper nativo no carga; sin
+                                    ' esto se escribia un .dds vacio por textura y despues se borraba el .ba2,
+                                    ' que era la unica copia. Se sigue escribiendo lo que haya (el resto del
+                                    ' unpack es util) pero el archive NO se borra.
+                                    If bytes.Length = 0 Then archiveFullyExtracted = False
+
+                                    ' ⛔ EL FALLO DE UNA ENTRADA NO SE LLEVA LA CORRIDA. Ver el ⛔ del docstring:
+                                    ' un suelto de SOLO LECTURA rompía el Unpack entero y el re-intento volvía a
+                                    ' chocar contra el mismo archivo. Se anota, este archive NO se borra, y se
+                                    ' sigue. Al final se tira con la lista completa.
+                                    ' (El `Try` que cubre esto empieza ARRIBA, antes de EnsureDir: ver su ⛔.)
+                                    '
+                                    ' ⛔ EL RESPALDO DEL SUELTO EN CONFLICTO VA AL PRIMER SLOT LIBRE, y esto
+                                    ' NO es cosmético: acá había `File.Copy(outPath, outPath & ".bak.unpack",
+                                    ' True)`, o sea overwrite:=True sobre un nombre FIJO. Un segundo Unpack
+                                    ' DESTRUÍA el respaldo del primero — exactamente el defecto que la ley
+                                    ' del slot ya documenta en GuardarConCopia ("antes el nombre era el fijo
+                                    ' `.prev2` y el `Borrar` previo destruia la copia de una segunda caida").
+                                    ' Misma ley, una sola casa: `PrimerSlotLibre`, que es pública justamente
+                                    ' porque la comparten artefactos con vidas distintas.
+                                    '
+                                    ' ⛔ Y NO SE USA `GuardarConCopia` ACÁ, aunque sea la red de al lado: esa
+                                    ' BORRA su copia al salir bien (es red de CRASH, no retención). El
+                                    ' `.bak.unpack` es lo contrario — el suelto del usuario que estamos por
+                                    ' pisar, y que se queda hasta que él lo borre. Cambiarlo por
+                                    ' GuardarConCopia habría convertido una retención deliberada en pérdida
+                                    ' de datos silenciosa.
+                                    '
+                                    ' ⚠️ Y EL SLOT LIBRE TIENE UN COSTO QUE HAY QUE ACOTAR: sin nada más,
+                                    ' cada Unpack repetido sobre el mismo suelto dejaría OTRA copia entera
+                                    ' (`.bak.unpack`, `…2`, `…3`…). Lo que lo acota no es un umbral ni una
+                                    ' política de retención inventada: es una IMPLICACIÓN EXACTA — si lo que
+                                    ' hay en disco ya es byte por byte lo que íbamos a escribir, esta corrida
+                                    ' no cambia nada, así que no hay nada que respaldar y tampoco nada que
+                                    ' escribir. En el caso que hace crecer la lista (correr Unpack dos veces)
+                                    ' el conflicto es contra el archivo que escribió la corrida anterior, o
+                                    ' sea exactamente este caso.
+                                    Dim yaEstabaEscrito As Boolean = MismosBytes(outPath, bytes)
+                                    If Not yaEstabaEscrito AndAlso File.Exists(outPath) AndAlso New FileInfo(outPath).Length > 0 Then
+                                        Dim respaldo = EscrituraEnElLugar.PrimerSlotLibre(outPath, SUFIJO_BAK_UNPACK)
+                                        File.Copy(outPath, respaldo, overwrite:=False)
+                                        ' ⛔ `File.Copy` PROPAGA los atributos del origen (MEDIDO en
+                                        ' net8.0.30: un suelto OCULTO deja su copia OCULTA, uno de SOLO
+                                        ' LECTURA la deja de solo lectura). Sin esto, el respaldo del dato
+                                        ' del usuario le queda INVISIBLE justo cuando lo necesita. Es la
+                                        ' misma ley que GuardarConCopia aplica a su `.npcm.prev`, y por eso
+                                        ' se llama a la de allá en vez de escribir una segunda acá.
+                                        EscrituraEnElLugar.LimpiarAtributos(respaldo)
+                                        result.CopiasDeSueltos.Add(respaldo)
+                                    End If
+
+                                    ' ⛔ EN EL LUGAR, NO `WriteAllBytes`. CREATE_ALWAYS sobre un destino
+                                    ' OCULTO da ACCESS_DENIED (medido acá y en OSP_Clases.vb, net8.0.30);
+                                    ' OpenOrCreate + SetLength(0) escribe igual, CONSERVA el atributo y deja
+                                    ' el suelto adentro de SU mod bajo MO2 en vez de mandarlo a `overwrite`.
+                                    ' Salida regenerable ⇒ no sincroniza: ese default está MEDIDO y acá son
+                                    ' miles de archivos por corrida.
+                                    ' El parámetro se llama `salida` y no `fs`: `fs` es el FileStream del
+                                    ' archive que estamos LEYENDO, y sombrearlo no compila (BC36641).
+                                    If Not yaEstabaEscrito Then
+                                        EscrituraEnElLugar.Escribir(outPath, Sub(salida) salida.Write(bytes, 0, bytes.Length))
+                                    End If
+                                    ' Se lista igual: el suelto ESTÁ en disco con el contenido de la entrada,
+                                    ' que es lo que el llamador necesita saber para registrarlo. Que esta
+                                    ' corrida no haya tenido que escribirlo no lo hace menos extraído.
+                                    result.LooseFilesWritten.Add(outPath)
+                                Catch exEscritura As Exception
+                                    archiveFullyExtracted = False
+                                    result.Fallos.Add($"  · {relPath}: {exEscritura.Message}")
+                                End Try
 
                                 entriesDone += 1
                                 If onEntry IsNot Nothing Then onEntry(entriesDone, totalEntries, relPath)
                             Next
                         End Using
                     End Using
-                Catch
+                Catch exArchive As Exception
+                    ' ⛔⛔ ACA HABIA UN `Throw` PELADO, Y ERA LA MISMA PERDIDA DE DATOS QUE CIERRA
+                    ' UnpackParcialException, POR LA OTRA PUERTA. `Unpack` tiene DOS salidas por error: la
+                    ' final (que lleva el resultado) y esta. Con el `Throw` crudo, un archive corrupto en
+                    ' mitad del set tiraba una InvalidDataException SIN resultado — y para entonces los
+                    ' archives ANTERIORES ya se habian extraido Y BORRADO. El llamador
+                    ' (`WM_PackUnpack.Unpack`) solo atrapa `UnpackParcialException`, asi que no registraba
+                    ' esos sueltos: contenido cuya UNICA copia acababa de pasar a ser suelta quedaba
+                    ' invisible para la app. Gate: Tools\UnpackSueltosGate U7.
+                    ' Se anota como un fallo mas y se CORTA el barrido: lo que ya se extrajo esta en disco
+                    ' y listado, este archive no se borra (archiveFullyExtracted = False), los plugins se
+                    ' conservan porque no todos los archives se fueron, y la salida final tira
+                    ' UnpackParcialException CON el resultado. El mensaje del fallo nombra el archive.
+                    ' ⛔ EXIT FOR, NO CONTINUE: si un archive del set no se pudo ni abrir, no sabemos en
+                    ' que estado esta el resto; seguir seria borrar archives apoyandose en una lectura
+                    ' parcial. El usuario arregla lo que el mensaje nombra y vuelve a correr Unpack, que
+                    ' sigue donde quedo — que es lo que promete el texto de la excepcion.
                     archiveFullyExtracted = False
-                    Throw
+                    result.Fallos.Add($"  · {Path.GetFileName(archivePath)}: {exArchive.Message}")
+                    Exit For
                 End Try
 
                 ' Delete the source archive only after all its entries are safely on disk as loose.
@@ -1625,9 +2296,35 @@ Namespace BethesdaArchive.Core
                 If cancelled Then Exit For
             Next
 
+            ' ⛔ EL CENSO DE LO QUE QUEDÓ, ANTES DE CUALQUIER SALIDA. Va acá —después del bucle y antes
+            ' de la fase de plugins— porque desde este punto TODAS las salidas (bien, error, cancelación)
+            ' pasan por abajo, y el llamador necesita esta lista en las tres. Ver ArchivesConservados.
+            For Each a In info.Archives
+                If Not result.ArchivesRemoved.Contains(a, StringComparer.OrdinalIgnoreCase) Then
+                    result.ArchivesConservados.Add(a)
+                End If
+            Next
+
             ' Phase 2: plugins. Delete only if extraction was not cancelled — leaving plugins behind
             ' on cancel keeps the engine able to find the still-existing archives if any survived.
-            If Not cancelled Then
+            '
+            ' ⛔⛔ Y SOLO SI NO QUEDO NINGUN ARCHIVE EN DISCO. La convencion del motor es que `Foo.esp`
+            ' auto-carga `Foo - Main.ba2`: borrar el plugin dejando su archive vivo es dejar contenido que
+            ' NO LO CARGA NADIE — los assets desaparecen in-game y el usuario no tiene forma de saber por
+            ' que.
+            ' ⛔ ACA PREGUNTABA `result.Fallos.Count = 0`, QUE ES OTRA COSA. "No hubo fallos" NO implica
+            ' "no quedo ningun archive": hay por lo menos dos caminos que conservan un archive SIN poblar
+            ' `Fallos` —
+            '   · el EXTRACT VACIO de mas arriba (`bytes.Length = 0` ⇒ `archiveFullyExtracted = False`),
+            '     que es el wrapper de DirectXTex caido sobre una entrada DX10; y
+            '   · el `File.Delete(archivePath)` que NO PUDO (su Catch lo deja en disco a proposito).
+            ' En los dos el .esp ancla se borraba con su .ba2 todavia ahi.
+            ' La invariante que de verdad autoriza a sacar el ancla se MIDE, no se infiere: TODOS los
+            ' archives del set que se descubrieron al empezar fueron efectivamente borrados. Es lo que
+            ' `ArchivesRemoved` cuenta, y se compara contra `info.Archives`, que es de donde salieron.
+            ' Gate: Tools\UnpackSueltosGate U5.
+            Dim todosLosArchivesSeFueron = (result.ArchivesRemoved.Count = info.Archives.Count)
+            If Not cancelled AndAlso todosLosArchivesSeFueron Then
                 For Each pluginPath In info.Plugins
                     Try
                         File.Delete(pluginPath)
@@ -1635,6 +2332,21 @@ Namespace BethesdaArchive.Core
                     Catch
                     End Try
                 Next
+            End If
+
+            ' ⛔ SE TIRA AL FINAL, CON LA LISTA COMPLETA — no en el primero. Todo lo que se pudo extraer YA
+            ' esta en disco y ningun archive con una entrada fallada se borro, asi que el estado es
+            ' recuperable: el usuario arregla lo que el mensaje nombra (un suelto de solo lectura, un
+            ' permiso) y vuelve a correr Unpack, que sigue donde quedo.
+            ' ⛔ Y SE TIRA CON EL RESULTADO ADENTRO, no pelado: "todo lo demas si se extrajo" es una
+            ' afirmacion sobre el DISCO, y el llamador necesita la LISTA para registrarlo. Ver
+            ' UnpackParcialException, que es donde esta el por que entero.
+            If result.Fallos.Count > 0 Then
+                Throw New UnpackParcialException(
+                    $"{result.Fallos.Count} archivo(s) no se pudieron escribir. Los archives que los " &
+                    "contienen NO se borraron y todo lo demas si se extrajo: arregla lo de abajo y volve a " &
+                    "correr Unpack, que sigue donde quedo." & Environment.NewLine &
+                    String.Join(Environment.NewLine, result.Fallos), result)
             End If
 
             Return result

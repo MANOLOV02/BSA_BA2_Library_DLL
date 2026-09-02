@@ -25,6 +25,35 @@ Public NotInheritable Class EscrituraEnElLugar
     Private Sub New()
     End Sub
 
+    ''' <summary>El cuerpo CERRO el stream, rompiendo el contrato de <see cref="EscribirNucleo"/>.
+    ''' <para>⛔ ES UN TIPO PROPIO PORQUE HAY UNA DECISION COLGADA DE EL, no para clasificar mejor. Cuando
+    ''' esto se tira, la escritura del cuerpo YA TERMINO: el wrapper cerro y vacio, y los bytes que hay en
+    ''' el destino son exactamente los que el cuerpo produjo. Lo unico que la violacion se llevo puesto es
+    ''' la GARANTIA DE DURABILIDAD (el <c>Flush(True)</c> de esta clase no llego a correr).</para>
+    ''' <para><b>Por eso un destino NUEVO no se borra en este camino, y ese es el cambio.</b> El
+    ''' <c>Borrar(destino)</c> de <see cref="Escribir"/> existe para no dejar "un archivo de 0 bytes donde
+    ''' antes no habia NADA" — un archivo del que no sabemos nada porque el cuerpo murio a mitad. Acá el
+    ''' cuerpo NO murio: volvio normalmente. Y con un cuerpo bien portado esos mismos bytes se aceptan sin
+    ''' verificar nada —<see cref="Escribir"/> no mira un solo byte antes de devolver "guardado"—, asi que
+    ''' aplicarles un estandar mas duro por el solo hecho de que el cuerpo uso un wrapper es una asimetria
+    ''' que no se sostiene: no sabemos MENOS del archivo en un caso que en el otro.</para>
+    ''' <para>⛔ Y SE SIGUE TIRANDO IGUAL. Que el archivo se conserve no vuelve buena a la corrida: el
+    ''' llamador tiene que arreglar el <c>leaveOpen:=True</c> antes de confiar en la durabilidad de lo que
+    ''' acaba de escribir. Conservar el archivo y avisar son cosas distintas.</para>
+    ''' <para>⚠️ NO cambia el otro brazo: si el CUERPO TIRO, los bytes del destino si son desconocidos
+    ''' (pudo morir a mitad) y el borrado del destino nuevo se queda como estaba. Tampoco cambia la
+    ''' restauracion desde la copia de <see cref="GuardarConCopia"/>: alli el destino EXISTIA y devolverle
+    ''' al usuario su version anterior es lo correcto pase lo que pase.</para>
+    ''' <para>Hereda de <see cref="InvalidOperationException"/> a proposito: es lo que los llamadores y el
+    ''' gate ya atrapan, asi que nadie que hoy lo maneje deja de manejarlo.</para></summary>
+    Public NotInheritable Class ContratoDelCuerpoException
+        Inherits InvalidOperationException
+
+        Public Sub New(mensaje As String)
+            MyBase.New(mensaje)
+        End Sub
+    End Class
+
     ''' <summary>Sufijo de la copia. NO es `.bak` (lo usa ArchivePackager) ni `.npcm.bak` (ese es el
     ''' respaldo de LoadOrderActivator, que vive hasta que su escritura queda CONFIRMADA por el verify
     ''' de relectura y recien ahi se borra — misma ley que esta, con el punto de confirmacion corrido).
@@ -37,7 +66,19 @@ Public NotInheritable Class EscrituraEnElLugar
     ''' llamadores lo usan para distinguir "no pude ni empezar" (destino intacto) de "fallo escribiendo".
     ''' <para><paramref name="sincronizar"/> agrega un <c>FlushFileBuffers</c> antes de cerrar: los bytes
     ''' llegan al plato y no se quedan en la cache del sistema. Ver <see cref="Escribir"/> para el costo
-    ''' MEDIDO y por que el default es False.</para></summary>
+    ''' MEDIDO y por que el default es False.</para>
+    ''' <para>⛔⛔ CONTRATO DEL CUERPO: <b>el cuerpo escribe en el stream y NO LO CIERRA.</b> El dueño del
+    ''' stream es esta clase, que lo abre, lo trunca, lo sincroniza y lo cierra. Un cuerpo que envuelve el
+    ''' stream en un `BinaryWriter` / `StreamWriter` / `XmlWriter` / `GZipStream` dentro de un `Using`
+    ''' <b>tiene que pasar `leaveOpen:=True`</b>, porque si no el `End Using` del wrapper cierra el
+    ''' FileStream de abajo.</para>
+    ''' <para>Esto no es teorico y el costo fue una app cerrada: `OSD_Class.Save_As` envolvia en
+    ''' `New IO.BinaryWriter(stream)` sin `leaveOpen`. Mientras no habia nada despues de `cuerpo(fs)` el
+    ''' defecto era invisible —el stream se cerraba dos veces y a nadie le importaba—; en cuanto el
+    ''' `Flush(True)` se puso DESPUES del cuerpo, el mismo codigo empezo a tirar
+    ''' `ObjectDisposedException: Cannot access a closed file` en produccion. Por eso la guarda de abajo
+    ''' existe: el proximo violador tiene que fallar diciendo QUE contrato rompio y sobre QUE archivo, no
+    ''' con un ObjectDisposed criptico desde las entrañas del framework.</para></summary>
     Private Shared Sub EscribirNucleo(destino As String, cuerpo As Action(Of Stream), ByRef seToco As Boolean,
                                       Optional sincronizar As Boolean = False)
         seToco = False
@@ -50,6 +91,27 @@ Public NotInheritable Class EscrituraEnElLugar
             seToco = True
             fs.SetLength(0)
             cuerpo(fs)
+
+            ' ⛔ GUARDA DEL CONTRATO. Si el cuerpo cerro el stream, `CanWrite` da False y CUALQUIER cosa
+            ' que hagamos despues revienta con un mensaje que no nombra ni la causa ni el archivo. Se
+            ' falla ACA, diciendo las dos cosas.
+            ' ⛔ Y NO se saltea el Flush en silencio: un cuerpo que cierra el stream ya se llevo puesta la
+            ' garantia de durabilidad (el wrapper cerro y sincronizo lo que quiso, cuando quiso), asi que
+            ' seguir de largo seria devolver "guardado" sobre una promesa que no podemos sostener.
+            ' ⛔ TIPO PROPIO, no un InvalidOperationException pelado: los llamadores tienen que poder
+            ' distinguir ESTE fallo de cualquier otro, porque de el cuelga si el destino nuevo se borra o
+            ' se conserva. Ver ContratoDelCuerpoException. Deriva de InvalidOperationException, asi que
+            ' quien ya lo atrapaba lo sigue atrapando.
+            If Not fs.CanWrite Then
+                Throw New ContratoDelCuerpoException(
+                    $"The write body closed the stream for '{IO.Path.GetFileName(destino)}'. Bodies passed to " &
+                    "EscrituraEnElLugar must write and NOT close: this class owns the stream (it opens, " &
+                    "truncates, syncs and closes it). If the body wraps the stream in a BinaryWriter, " &
+                    "StreamWriter, XmlWriter or similar inside a Using, pass leaveOpen:=True. " &
+                    "The file was left with the bytes the body wrote, but WITHOUT the durability flush " &
+                    "this class guarantees.")
+            End If
+
             ' Adentro del Using: cerrar NO sincroniza. Sin esto los bytes viven en la cache del sistema y
             ' un corte de luz se los lleva aunque el guardado haya dicho que salio bien.
             If sincronizar Then fs.Flush(True)
@@ -58,6 +120,14 @@ Public NotInheritable Class EscrituraEnElLugar
 
     ''' <summary>Sobrescribe <paramref name="destino"/>. Sin red: es el camino de la salida regenerable
     ''' (horneado, build, texturas, materiales, cache, .pex).
+    ''' <para>⛔ QUE SIGNIFICA "materiales" EN ESA LISTA, porque la ambiguedad ya costo una revision: es el
+    ''' camino de CLONE (<c>Clone_Materials_class.WriteMaterialJob</c>, que escribe a <c>ManoloCloned\</c> —
+    ''' una carpeta que la app posee y regenera sola en la corrida siguiente). NO es el guardado de un
+    ''' material desde el editor de Wardrobe Manager: ese pisa un suelto YA INSTALADO que la app no
+    ''' produjo y no puede rehacer, es un archivo por click, y va por <see cref="GuardarConCopia"/> —
+    ''' igual que <c>NifContent_Class.Save_As_Manolo_ConCopia</c> frente a <c>Save_As_Manolo</c>.</para>
+    ''' <para>⛔ LA LISTA NO SE LEE POR TIPO DE ARCHIVO, SE LEE POR LLAMADOR. El NIF esta en las DOS
+    ''' listas y el material tambien: lo que decide es quien escribe y si lo escrito se puede rehacer.</para>
     ''' <para>⛔ <paramref name="sincronizar"/> DEFAULTEA EN FALSE Y ESE DEFAULT ESTA MEDIDO. Con la forma
     ''' exacta de <see cref="EscribirNucleo"/> (OpenOrCreate → SetLength(0) → Write → Dispose), 300
     ''' archivos preexistentes reescritos, dos corridas alternadas por configuracion:</para>
@@ -79,9 +149,16 @@ Public NotInheritable Class EscrituraEnElLugar
         Dim seToco As Boolean = False
         Try
             EscribirNucleo(destino, cuerpo, seToco, sincronizar)
+        Catch ex As ContratoDelCuerpoException
+            ' ⛔ ACA NO SE BORRA, y el motivo entero esta en ContratoDelCuerpoException: el cuerpo VOLVIO
+            ' NORMALMENTE y despues fallo la guarda, asi que los bytes del destino son exactamente los que
+            ' el cuerpo produjo — los mismos que, viniendo de un cuerpo bien portado, esta funcion acepta
+            ' sin verificar nada. Lo que se perdio es el Flush, no el archivo. Se tira igual.
+            Throw
         Catch
             ' No dejar un archivo de 0 bytes donde antes no habia NADA: el juego y xEdit levantan un
-            ' .esp vacio como corrupto.
+            ' .esp vacio como corrupto. Este brazo es el del cuerpo que TIRO: ahi los bytes SI son
+            ' desconocidos (pudo morir a mitad) y el borrado se queda como estaba.
             If seToco AndAlso Not existia Then Borrar(destino)
             Throw
         End Try
@@ -91,6 +168,14 @@ Public NotInheritable Class EscrituraEnElLugar
     ''' la escritura falla DESPUES de haber empezado, restaura el destino solo. Es el camino de los datos
     ''' del usuario (plugin, ini de BodyGen, sidecars, proyecto de WM). NO se usa en horneado ni en build:
     ''' ahi son miles de archivos por corrida y se regeneran solos.
+    ''' <para>⛔ "RESTAURA EL DESTINO SOLO" ES UNA PROMESA, Y ESTUVO ROTA. La restauracion era un
+    ''' <c>File.Copy</c> —CREATE_ALWAYS— mientras la escritura ya usaba <c>OpenOrCreate</c>: sobre un
+    ''' destino OCULTO, que es justo el caso para el que existe todo este diseño, el camino de ida
+    ''' funcionaba y el de vuelta tiraba, dejando el destino PARCIAL. Hoy la vuelta usa la MISMA primitiva
+    ''' que la ida. Testigos: caso <c>M</c> (la medicion de que primitiva aguanta que atributo) y
+    ''' <c>G21</c> (destino oculto restaurado byte a byte y todavia oculto) de
+    ''' <c>Tools\EscrituraEnElLugarGate</c>; <c>G8</c> es el mismo camino con destino normal, que es por lo
+    ''' que el defecto podia vivir sin que nada se pusiera rojo.</para>
     ''' <para>⛔ LA COPIA NO ES OPCIONAL. Si hay contenido que perder y no se pudo dejar una copia
     ''' VERIFICADA (el tamano tiene que coincidir: File.Copy puede dejarla a medias), NO se escribe. Antes
     ''' esto seguia igual "porque cancelar el guardado seria peor", y el resultado era truncar el unico
@@ -125,6 +210,7 @@ Public NotInheritable Class EscrituraEnElLugar
 
         Dim tieneContenido As Boolean = File.Exists(destino) AndAlso New FileInfo(destino).Length > 0
         Dim copiaHecha As Boolean = False
+        Dim causaCopia As String = ""
         If tieneContenido Then
             Try
                 File.Copy(destino, copia, overwrite:=True)
@@ -140,8 +226,13 @@ Public NotInheritable Class EscrituraEnElLugar
                     ' copia Y el destino, que es justo el estado que toda esta clase existe para evitar.
                     Sincronizar(copia)
                 End If
-            Catch
+            Catch ex As Exception
+                ' ⛔ LA CAUSA REAL NO SE TIRA A LA BASURA. Acá habia un `Catch` pelado, asi que una
+                ' `PathTooLongException`, una `DirectoryNotFoundException` o una `NotSupportedException`
+                ' salian todas disfrazadas del mensaje fijo de abajo —"disco lleno o el archivo tomado"— y
+                ' el usuario se quedaba buscando espacio en disco por un problema de ruta.
                 copiaHecha = False
+                causaCopia = ex.Message
                 Borrar(copia)
             End Try
 
@@ -149,10 +240,15 @@ Public NotInheritable Class EscrituraEnElLugar
             ' original: escribir igual seria destruir la unica copia que existe sin nada para volver. El
             ' usuario ve por que fallo (disco lleno, permisos, el archivo tomado) y su dato sigue entero.
             If Not copiaHecha Then
+                ' El `causaCopia` va EMBEBIDO en el texto y no como InnerException: los dialogos de la app
+                ' muestran solo `.Message` (FomodExport_Form.vb:355 lo documenta para el caso gemelo), asi
+                ' que un inner es una causa que nadie ve. Cuando la copia fallo por tamaño —no hubo
+                ' excepcion, solo no coincidio— no hay causa que agregar y el mensaje queda como estaba.
                 Throw New IOException(
                     $"'{IO.Path.GetFileName(destino)}' was NOT modified: its backup could not be created" &
                     $" ('{IO.Path.GetFileName(copia)}'). Free up disk space or close whatever is holding " &
-                    "that file, then save again.")
+                    "that file, then save again." &
+                    If(causaCopia = "", "", Environment.NewLine & causaCopia))
             End If
         End If
 
@@ -170,12 +266,45 @@ Public NotInheritable Class EscrituraEnElLugar
                 If copiaHecha Then Borrar(copia)
                 Throw
             End If
-            If seToco AndAlso Not existia Then Borrar(destino)
+            ' ⛔ MISMA EXCEPCION QUE EN `Escribir`, MISMA LEY: un destino NUEVO no se borra cuando lo unico
+            ' que fallo fue la guarda del contrato — el cuerpo volvio normalmente y esos bytes son los
+            ' suyos. (En la practica este brazo solo se alcanza con un destino que NO existia, porque si
+            ' existia con contenido hay `copia` y manda la restauracion de abajo, que NO se toca: alli
+            ' devolverle al usuario su version anterior es lo correcto pase lo que pase.)
+            If seToco AndAlso Not existia AndAlso Not (TypeOf ex Is ContratoDelCuerpoException) Then Borrar(destino)
             If copiaHecha Then
                 ' Solo se restaura desde la copia que tomo ESTA corrida: es la unica de la que sabemos
                 ' que contenido tiene. La heredada se deja donde esta.
+                '
+                ' ⛔⛔ LA RESTAURACION USA LA MISMA PRIMITIVA QUE LA ESCRITURA, Y ESTO ERA UN DEFECTO REAL.
+                ' Acá habia `File.Copy(copia, destino, overwrite:=True)`. `File.Copy` pide CREATE_ALWAYS,
+                ' y CREATE_ALWAYS sobre un destino OCULTO da ERROR_ACCESS_DENIED — la MISMA trampa que la
+                ' cabecera de esta clase documenta para la escritura y que `EscribirNucleo` resuelve con
+                ' OpenOrCreate. O sea que el camino de ida estaba blindado y el de vuelta no:
+                ' <b>exactamente sobre los archivos ocultos para los que este diseño existe, la
+                ' restauracion automatica que promete el docstring NO funcionaba.</b> El destino quedaba
+                ' con lo que el cuerpo alcanzo a escribir (PARCIAL) y el usuario recibia el mensaje de
+                ' "no se pudo restaurar" — su version anterior sobrevivia en la copia, pero la promesa
+                ' era falsa. Afecta a todo GuardarConCopia: ESP, NIF, materiales, OSP/OSD, BodyGen y
+                ' sidecars. Lo dejan OneDrive y los desempaquetadores, asi que no es raro.
+                '
+                ' MEDIDO en net8.0.30 (gate: caso M de EscrituraEnElLugarGate, que lo remide en cada
+                ' corrida en vez de dejarlo escrito en un comentario que puede envejecer):
+                '   File.Copy(-> destino OCULTO, overwrite:=True) .... UnauthorizedAccessException
+                '   OpenOrCreate + SetLength(0) sobre OCULTO ......... OK, y CONSERVA el atributo
+                '
+                ' Se abre la COPIA primero y recien despues se toca el destino: es la misma forma que usa
+                ' VolcarEncima, y evita que un fallo abriendo la copia deje el destino ya truncado.
+                ' sincronizar:=True por el mismo motivo que el resto de este metodo: es el dato del
+                ' usuario volviendo a su lugar.
                 Try
-                    File.Copy(copia, destino, overwrite:=True)
+                    Dim seTocoRestaurando As Boolean = False
+                    Using fsCopia As New FileStream(copia, FileMode.Open, FileAccess.Read, FileShare.Read)
+                        EscribirNucleo(destino,
+                                       Sub(fsDestino) fsCopia.CopyTo(fsDestino),
+                                       seTocoRestaurando,
+                                       sincronizar:=True)
+                    End Using
                 Catch
                     Throw New IOException(MensajeCopiaViva(destino, copia), ex)
                 End Try
@@ -222,11 +351,28 @@ Public NotInheritable Class EscrituraEnElLugar
     ''' no intentan una recuperacion que si hacia falta.</para>
     ''' <para>El unico hueco, y se dice: si el <c>SetLength(0)</c> de <see cref="EscribirNucleo"/> tirara,
     ''' el callback no corre y el destino queda en estado desconocido. El <c>seToco</c> interno si cubre
-    ''' ese instante; la senal publica no. No hay medicion de que ese fallo ocurra.</para></summary>
+    ''' ese instante; la senal publica no. No hay medicion de que ese fallo ocurra.</para>
+    ''' <para>⛔⛔ <paramref name="sincronizar"/> DEFAULTEA EN <b>True</b>, al reves que en
+    ''' <see cref="Escribir"/>, y el motivo es el patron de los llamadores: <b>los tres que borran la otra
+    ''' copia inmediatamente despues</b> — <c>ArchivePackager</c> (borra el `.new` y su sello),
+    ''' <c>FomodExporter</c> (borra el `.tmp`) y el "move project" de Wardrobe Manager (borra el `.osp`
+    ''' ORIGEN). En los tres, apenas vuelve esta llamada el destino pasa a ser <b>el unico ejemplar</b>. Sin
+    ''' el flush, el borrado de la otra copia puede llegar al plato ANTES que los bytes que la reemplazan y
+    ''' un corte de luz se lleva las dos — que es exactamente el estado que toda esta clase existe para
+    ''' evitar, y el mismo que documenta el «la red solo es red si llego al plato» de
+    ''' <see cref="GuardarConCopia"/>.</para>
+    ''' <para>Va por DEFAULT y no por pedido porque lo peligroso tiene que ser lo que exige justificacion
+    ''' explicita, no al reves: un llamador nuevo que vuelque y borre hereda la garantia sin saber que
+    ''' existe. El opt-out es para el camino MEDIDO que no puede pagarlo — hoy uno solo:
+    ''' <c>OSP_Clases.CommitTextureJobs</c>, cientos de archivos por corrida, que ademas NO borra el origen
+    ''' (el origen es el suelto del juego) y por lo tanto no necesita la garantia. Costo del flush, medido
+    ''' en <see cref="Escribir"/>: +2,66 a +4,53 ms POR LLAMADA — despreciable en un volcado de archive de
+    ''' GiB, caro en un lote de cientos de texturas.</para></summary>
     Public Shared Sub VolcarEncima(origen As String, destino As String,
                                    Optional reintentos As Integer = 10,
                                    Optional esperaMs As Integer = 200,
-                                   Optional alTocarElDestino As Action = Nothing)
+                                   Optional alTocarElDestino As Action = Nothing,
+                                   Optional sincronizar As Boolean = True)
         If String.IsNullOrEmpty(origen) Then Throw New ArgumentException("Empty path.", NameOf(origen))
         If String.IsNullOrEmpty(destino) Then Throw New ArgumentException("Empty path.", NameOf(destino))
         If reintentos < 1 Then Throw New ArgumentOutOfRangeException(NameOf(reintentos))
@@ -252,7 +398,8 @@ Public NotInheritable Class EscrituraEnElLugar
                                            alTocarElDestino?.Invoke()
                                            src.CopyTo(fs)
                                        End Sub,
-                                       seToco)
+                                       seToco,
+                                       sincronizar)
                     Catch
                         ' Misma ley que Escribir: donde no habia nada, no queda un archivo de 0 bytes.
                         If seToco AndAlso Not existiaDestino Then Borrar(destino)
@@ -310,8 +457,12 @@ Public NotInheritable Class EscrituraEnElLugar
     ''' precio de equivocarse es borrar el unico ejemplar del dato del usuario.</para>
     ''' <para>Costo: cero en el camino sano, porque sin copias heredadas no se llama. Cuando se llama,
     ''' son dos lecturas secuenciales de un archivo que esta misma corrida YA copio entero unas lineas
-    ''' antes — es estrictamente menos que el `File.Copy` que el metodo ya paga.</para></summary>
-    Private Shared Function MismoContenido(a As String, b As String) As Boolean
+    ''' antes — es estrictamente menos que el `File.Copy` que el metodo ya paga.</para>
+    ''' <para>⛔ ES PUBLICO A PROPOSITO, y por eso el predicado vive ACA y no se reimplementa: la misma
+    ''' ley de retencion —"un respaldo se descarta SOLO cuando se PROBO byte por byte que no guarda nada
+    ''' propio"— la necesita <c>FomodExporter</c> para sus <c>.recovered</c>. Dos implementaciones del
+    ''' mismo predicado es como se empiezan a borrar ejemplares unicos por un lado y no por el otro.</para></summary>
+    Public Shared Function MismoContenido(a As String, b As String) As Boolean
         Try
             Dim fa As New FileInfo(a), fb As New FileInfo(b)
             If Not fa.Exists OrElse Not fb.Exists Then Return False
@@ -368,7 +519,17 @@ Public NotInheritable Class EscrituraEnElLugar
         End Try
     End Sub
 
-    Private Shared Sub LimpiarAtributos(ruta As String)
+    ''' <summary>Le saca a un RESPALDO recien copiado los atributos que lo esconden o lo congelan.
+    ''' <para>⛔ HACE FALTA PORQUE <c>File.Copy</c> PROPAGA LOS ATRIBUTOS DEL ORIGEN. MEDIDO en net8.0.30:
+    ''' copiar un archivo OCULTO deja la copia OCULTA, y uno de SOLO LECTURA la deja de SOLO LECTURA. Sin
+    ''' esto, el respaldo del dato del usuario le queda INVISIBLE justo cuando lo necesita, y ademas un
+    ''' respaldo de solo lectura no se puede borrar despues.</para>
+    ''' <para>⛔ SOLO SE APLICA A COPIAS QUE ESTA CLASE (o el packer) ACABA DE CREAR. NUNCA al archivo del
+    ''' usuario: sacarle el oculto a un archivo suyo seria una ley nueva, y la cabecera de
+    ''' <see cref="EscribirNucleo"/> es explicita en que la escritura CONSERVA el atributo.</para>
+    ''' <para>Es publico para que el `.bak.unpack` de <c>ArchivePackager.Unpack</c> —el otro respaldo del
+    ''' arbol que nace de un <c>File.Copy</c>— use ESTA ley y no una segunda copiada al lado.</para></summary>
+    Public Shared Sub LimpiarAtributos(ruta As String)
         Try
             Dim attr = File.GetAttributes(ruta)
             Dim malos = FileAttributes.ReadOnly Or FileAttributes.Hidden
