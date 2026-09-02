@@ -515,82 +515,54 @@ Public NotInheritable Class EscrituraEnElLugar
         End If
     End Sub
 
-    ''' <summary>Margen sobre el tamaño de los respaldos: 64 MiB. Cubre el diario, el crecimiento de los
-    ''' archivos que se están por escribir y la metadata del sistema de archivos.
-    ''' <para>⛔ CONSTANTE NOMBRADA Y UNA SOLA VEZ. Un 64 repetido en cada llamador es un número que nadie
-    ''' puede cambiar sin cazarlos a todos.</para></summary>
-    Public Const MargenDeEspacioParaRespaldos As Long = 64L * 1024L * 1024L
+    ''' <summary>Los bits de atributo que esta aplicacion puede QUITAR y volver a APLICAR con
+    ''' <c>SetAttributes</c>.
+    ''' <para>⛔ SE EXCLUYEN LOS BITS QUE MANEJA EL FILESYSTEM: Directory, ReparsePoint, Compressed,
+    ''' Encrypted, SparseFile, Device, IntegrityStream, NoScrubData y los RecallOn*. Comparar —o reaplicar—
+    ''' el valor CRUDO que devuelve <c>GetAttributes</c> da falsos errores: en un volumen comprimido de
+    ''' NTFS el bit <c>Compressed</c> aparece solo y <c>SetAttributes</c> no lo controla, asi que un verify
+    ''' contra el valor completo fallaria SIEMPRE — y el rollback declararia ROTO un archivo que volvio
+    ''' perfecto. Un error de rollback falso es peor que no verificar: manda al usuario a buscar un daño
+    ''' que no existe.</para>
+    ''' <para>⛔ ES LA UNICA DEFINICION DE ESA MASCARA. La usan el registro del diario, el rollback en
+    ''' proceso y la recuperacion del arranque. Dos mascaras distintas es como una empieza a guardar un bit
+    ''' que la otra no puede reponer.</para></summary>
+    Public Const MascaraDeAtributosRestaurables As FileAttributes =
+        FileAttributes.ReadOnly Or FileAttributes.Hidden Or FileAttributes.System Or
+        FileAttributes.Archive Or FileAttributes.NotContentIndexed Or FileAttributes.Temporary
 
-    ''' <summary>Aborta ANTES de que el lote cree su primera copia si el espacio libre no alcanza.
-    ''' <para>⛔ POR QUE ANTES Y NO DURANTE. El pico de un lote sano es «los destinos actuales + sus copias»,
-    ''' y quedarse sin espacio a mitad es el peor momento posible: ya hay etapas escritas, el rollback
-    ''' necesita escribir para devolverlas, y escribir es justo lo que no se puede. Fallar antes de tocar
-    ''' nada deja el disco exactamente como estaba.</para>
-    ''' <para><paramref name="libre"/> se pasa por parámetro a propósito: es lo que hace la ley MEDIBLE. Un
-    ''' gate no puede llenar el disco real, pero sí puede inyectar el número y verificar el umbral. El
-    ''' llamador de producción usa la sobrecarga de abajo, que lo resuelve con <c>DriveInfo</c>.</para>
-    ''' <para>Sólo se suman los destinos que EXISTEN: de los que no existen no se toma copia (son
-    ''' creaciones), así que no ocupan espacio de respaldo.</para></summary>
-    Public Shared Sub ExigirEspacioParaLote(destinos As IEnumerable(Of String), libre As Long)
-        If destinos Is Nothing Then Return
-        Dim requerido As Long = 0
-        For Each d In destinos
-            If String.IsNullOrEmpty(d) Then Continue For
-            Try
-                If File.Exists(d) Then requerido += New FileInfo(d).Length
-            Catch
-                ' Un destino que no se puede medir no bloquea el guardado: el que decide es el espacio.
-            End Try
-        Next
-        If libre < requerido + MargenDeEspacioParaRespaldos Then
-            Throw New IOException(
-                "Not enough free space for a protected save. Required backup space: " &
-                $"{requerido:N0} bytes plus a {MargenDeEspacioParaRespaldos:N0} byte margin; available: " &
-                $"{libre:N0} bytes. Free up space and save again.")
-        End If
-    End Sub
+    ''' <summary>La parte restaurable de un valor de atributos. Devuelve <c>Normal</c> cuando no queda
+    ''' ninguno: ese es el valor que <c>SetAttributes</c> acepta para "sin atributos" — no se le puede
+    ''' pasar 0.</summary>
+    Public Shared Function AtributosRestaurables(valor As FileAttributes) As FileAttributes
+        Dim aplicables = valor And MascaraDeAtributosRestaurables
+        If aplicables = 0 Then Return FileAttributes.Normal
+        Return aplicables
+    End Function
 
-    ''' <summary>Igual, resolviendo el espacio libre del volumen donde viven los destinos.
-    ''' <para>Si no se puede consultar el volumen, NO se bloquea el guardado: un chequeo preventivo que no
-    ''' se pudo hacer no es motivo para negarle al usuario su guardado — el camino de fallo real sigue
-    ''' cubierto por «sin red no se trunca».</para></summary>
-    Public Shared Sub ExigirEspacioParaLote(destinos As IEnumerable(Of String))
-        If destinos Is Nothing Then Return
-        Dim primero = destinos.FirstOrDefault(Function(d) Not String.IsNullOrEmpty(d))
-        If primero Is Nothing Then Return
-        Dim libre As Long
-        Try
-            Dim raiz = IO.Path.GetPathRoot(IO.Path.GetFullPath(primero))
-            If String.IsNullOrEmpty(raiz) Then Return
-            libre = New DriveInfo(raiz).AvailableFreeSpace
-        Catch
-            Return
-        End Try
-        ExigirEspacioParaLote(destinos, libre)
-    End Sub
-
-    ''' <summary>Dónde viven los diarios de lote. ⛔ SIN SETEAR ⇒ LOS LOTES NO ESCRIBEN DIARIO, que es
+    ''' <summary>Donde viven los diarios de lote. ⛔ SIN SETEAR ⇒ LOS LOTES NO ESCRIBEN DIARIO, que es
     ''' EXACTAMENTE la conducta anterior. Cada app la setea al arrancar (p. ej.
     ''' <c>LocalApplicationData\&lt;app&gt;\diarios</c>); los arneses que no la setean no cambian de
     ''' comportamiento ni ensucian el disco del usuario con diarios de prueba.
-    ''' <para>No va bajo <c>Data</c>: es metadata de la aplicación, y ponerla al lado de los archivos del
-    ''' mod la metería bajo el VFS de MO2.</para></summary>
+    ''' <para>No va bajo <c>Data</c>: es metadata de la aplicacion, y ponerla al lado de los archivos del
+    ''' mod la meteria bajo el VFS de MO2.</para></summary>
     Public Shared Property CarpetaDeDiarios As String = ""
 
-    ''' <summary>Los diarios que quedaron de una corrida que NO terminó su lote. Es la API del arranque:
+    ''' <summary>Los diarios que quedaron de una corrida que NO termino su lote. Es la API del arranque:
     ''' la app los enumera, MUESTRA los destinos y sus copias, y le ofrece al usuario
     ''' <i>Restaurar estado anterior</i> o <i>Conservar estado actual</i>.
-    ''' <para>⛔ NO RESTAURA NADA. Después de un reinicio no hay forma de saber si el usuario quiere volver
-    ''' atrás o quedarse con lo nuevo; decidir por él sería pisarle el trabajo. Y el diario se borra SÓLO
-    ''' después de completar y verificar la decisión.</para>
-    ''' <para>Un diario ilegible no se cuenta: no se puede describir una transacción que no se pudo
-    ''' leer.</para></summary>
+    ''' <para>⛔ NO RESTAURA NADA. Despues de un reinicio no hay forma de saber si el usuario quiere volver
+    ''' atras o quedarse con lo nuevo; decidir por el seria pisarle el trabajo.</para>
+    ''' <para>⛔ LOS ILEGIBLES TAMBIEN SALEN. Antes se filtraban y un diario corrupto DESAPARECIA del
+    ''' arranque: el usuario perdia la unica pista de que hubo un guardado a medias, y las copias al lado de
+    ''' sus archivos quedaban sin explicacion. Ahora vuelven con su error adentro
+    ''' (<see cref="DiarioDeEscritura.EsLegible"/>) y el dialogo los muestra como tales — describir un
+    ''' problema que no se puede resolver solo es mejor que ocultarlo.</para></summary>
     Public Shared Function DiariosPendientes() As List(Of DiarioDeEscritura)
         Dim out As New List(Of DiarioDeEscritura)
         If String.IsNullOrEmpty(CarpetaDeDiarios) OrElse Not Directory.Exists(CarpetaDeDiarios) Then Return out
         For Each f In Directory.EnumerateFiles(CarpetaDeDiarios, "*" & DiarioDeEscritura.SufijoDiario)
-            Dim d = DiarioDeEscritura.Leer(f)
-            If d IsNot Nothing Then out.Add(d)
+            out.Add(DiarioDeEscritura.Leer(f))
         Next
         Return out
     End Function
@@ -663,20 +635,41 @@ Public NotInheritable Class EscrituraEnElLugar
             Public Property Heredadas As List(Of String)
             Public Property EsBorrado As Boolean
             Public Property Atributos As FileAttributes
+
+            ''' <summary>¿Este destino llegó a TOCARSE? ⛔ SEPARA "hay WAL" de "hay que deshacer", y
+            ''' son dos cosas distintas: la etapa se anota en `_etapas` apenas queda escrita en el diario
+            ''' —o sea ANTES de abrir el destino—, asi que existe un tramo en el que el diario ya la
+            ''' describe y el archivo todavia esta intacto. Si la apertura falla ahi (destino TOMADO, de
+            ''' SOLO LECTURA, carpeta sin permiso), volcarle la copia encima seria REESCRIBIR un archivo
+            ''' que esta ejecucion nunca modifico.
+            ''' <para>La etapa igual se conserva: participa de la LIMPIEZA (su copia se borra recien
+            ''' despues de `MarcarResuelto`, como todas), pero no de la RESTAURACION.</para>
+            ''' <para>⛔ El default es True y no es casual: deja intacta la semantica de todas las etapas
+            ''' que se anotan cuando el destino YA se toco — las de <see cref="Eliminar"/>, que registran
+            ''' despues del borrado.</para></summary>
+            Public Property RequiereRollback As Boolean = True
         End Class
 
         Private ReadOnly _etapas As New List(Of Etapa)
-        ' Nothing cuando `CarpetaDeDiarios` no esta seteada: lote sin diario = conducta anterior.
+        ' Nothing SOLO cuando `CarpetaDeDiarios` no esta seteada (opt-out explicito). Si esta seteada y el
+        ' diario no se puede abrir, `AbrirDiario` TIRA y el lote no llega a existir.
         Private ReadOnly _diario As DiarioDeEscritura = AbrirDiario()
 
+        ''' <summary>⛔ NO DEGRADA EN SILENCIO. Antes, un diario que no se podia crear devolvia Nothing
+        ''' y el lote seguia adelante SIN diario: el usuario creia tener recuperacion ante un corte y no la
+        ''' tenia — el peor de los dos mundos, porque una recuperacion que se cree presente cambia lo que el
+        ''' usuario hace despues. Si la carpeta esta configurada, el diario es parte del contrato: si no se
+        ''' puede abrir, no se toca NINGUN destino.
+        ''' <para>Carpeta VACIA sigue devolviendo Nothing a proposito: eso es el opt-out EXPLICITO —los
+        ''' arneses y los caminos que no configuran carpeta no escriben diario y no cambian de
+        ''' conducta—.</para></summary>
         Private Shared Function AbrirDiario() As DiarioDeEscritura
             If String.IsNullOrEmpty(CarpetaDeDiarios) Then Return Nothing
             Try
                 Return New DiarioDeEscritura(CarpetaDeDiarios)
-            Catch
-                ' Un diario que no se pudo abrir NO bloquea el guardado: se pierde la deteccion de un
-                ' corte, no el dato del usuario. El rollback en proceso sigue funcionando igual.
-                Return Nothing
+            Catch ex As Exception
+                Throw New IOException(
+                    "No se pudo crear el diario de recuperacion. No se modifico ningun archivo.", ex)
             End Try
         End Function
         Private _confirmado As Boolean = False
@@ -748,54 +741,87 @@ Public NotInheritable Class EscrituraEnElLugar
                 End If
             End If
 
+            ' ⛔⛔ LA ETAPA SE INCORPORA APENAS SU COPIA EXISTE — ANTES DEL DIARIO Y ANTES DE TOCAR EL
+            ' DESTINO. Es la regla, y de ella cuelgan dos defectos cerrados:
+            '
+            ' (1) Antes la etapa entraba a `_etapas` recien al terminar BIEN, asi que los `Catch` de aca
+            '     abajo tenian que recuperarla por un camino PARALELO y mas debil que el comun:
+            '     `Borrar(destino)` para una creacion parcial (tragado, sin verificar que el archivo se
+            '     fuera), `VolcarEncima` sin comparar los bytes despues, y `Borrar(copia)` — que ademas
+            '     VIOLABA el protocolo de dos estados, porque borraba el respaldo con el diario todavia en
+            '     `en_curso`. Y despues llamaba a `DeshacerYTirar`, cuyo rollback sólo conocia las etapas
+            '     ANTERIORES. Escenario que producia: creacion parcial + `Borrar` que falla en silencio ⇒
+            '     `Deshacer` no ve nada que hacer ⇒ informe vacio ⇒ diario `resuelto` y CERRADO con el
+            '     archivo a medias vivo en disco. Medido en R1/R2.
+            '
+            ' (2) Y va ANTES del `Registrar` y no despues: `Registrar` PUEDE TIRAR (si el diario no se
+            '     puede persistir, ver `AbrirDiario`). Con el `Add` despues, esa excepcion se llevaba
+            '     puesta una copia que YA existia en disco y que no estaba en ninguna lista — ni el
+            '     rollback la conocia ni la limpieza la levantaba: respaldo HUERFANO al lado del archivo
+            '     del usuario, sin nada que lo explique. Con el `Add` antes, la excepcion propaga, el
+            '     `Dispose` del `Using` deshace (esta etapa se saltea: el destino no se toco) y la copia
+            '     se va con la limpieza al resolver. Medido en R4.
+            '
+            ' ⚠️ EL `False` DE ACA ES UN DEFAULT DEFENSIVO Y NO ESTA MEDIDO, dicho en vez de escondido: hoy
+            ' todos los caminos que siguen lo pisan (éxito ⇒ True; los dos `Catch` ⇒ `= seToco`), asi que
+            ' voltearlo a True no pone rojo ningun caso. Se deja igual porque es el valor SEGURO — y ahora
+            ' ademas cubre de verdad el tramo `Registrar`, que esta entre este `Add` y el `Try`. Lo que SI
+            ' esta medido es el `= seToco` de los `Catch` (R3, y sus mutantes MR3b/MR4).
+            Dim etapaActual As New Etapa With {
+                .Destino = destino,
+                .Copia = If(copiaHecha, copia, ""),
+                .Heredadas = heredadas,
+                .RequiereRollback = False
+            }
+            _etapas.Add(etapaActual)
+
             ' ⛔ EL DIARIO SE ESCRIBE ACA: la copia ya esta asegurada y sincronizada, y el destino
             ' todavia NO se toco. Al reves el diario describiria algo que no paso, o el destino
             ' cambiaria sin que nadie lo hubiera anotado. Para una CREACION se registra antes de crear.
-            Dim existia = File.Exists(destino)
+            ' ⛔⛔ LA OPERACION SE DERIVA DE LA COPIA, NO DE UNA SEGUNDA CONSULTA AL FILESYSTEM. Acá habia
+            ' un `Dim existia = File.Exists(destino)`, y eso era una SEGUNDA lectura despues de la que
+            ' decidio si se tomaba copia (`existeDestino`, arriba). Entre las dos hay una ventana: si el
+            ' archivo aparece o desaparece en el medio —otro proceso, MO2 refrescando su VFS— el diario
+            ' sale con una forma que `DiarioDeEscritura.Leer` RECHAZA ("crear" con copia, o "reemplazar"
+            ' sin copia), y el arranque siguiente lo muestra ILEGIBLE: copias buenas en disco que la
+            ' recuperacion ya no puede usar. `copiaHecha` es la MISMA variable que decidio si hay copia,
+            ' asi que «copia presente ⟺ reemplazar» vale POR CONSTRUCCION y la ventana no existe.
+            ' ⚠️ La carrera en si NO es inyectable desde un arnes y queda declarada; lo que si esta medido
+            ' es la red de contencion —que `Leer` rechaza las dos formas invalidas— en D2.
             If _diario IsNot Nothing Then
                 _diario.Registrar(destino, If(copiaHecha, copia, ""),
-                                  If(existia, "reemplazar", "crear"), FileAttributes.Normal)
+                                  If(copiaHecha, "reemplazar", "crear"), FileAttributes.Normal)
             End If
+
             Dim seToco As Boolean = False
             Try
                 EscribirNucleo(destino, cuerpo, seToco, sincronizar:=True)
+                etapaActual.RequiereRollback = True
             Catch ex As ContratoDelCuerpoException
-                ' ⛔⛔ ACA EL LOTE DIVERGE DE LA LEY DE UN SOLO ARCHIVO, A PROPOSITO. Este comentario decia
-                ' "misma ley que `Escribir`: el archivo se conserva", y desde que existe el rollback de
-                ' creaciones eso es FALSO: la etapa se registra y `DeshacerYTirar` la deshace como a
-                ' cualquier otra — con copia le vuelca la version vieja encima, y si fue una CREACION la
-                ' BORRA.
+                ' ⛔⛔ ACA EL LOTE DIVERGE DE LA LEY DE UN SOLO ARCHIVO, A PROPOSITO. La ley no cambio con
+                ' este fix: cambio la VIA. Antes esta rama agregaba la etapa a mano; ahora la etapa ya
+                ' esta y sólo se marca — pero el resultado es el mismo, porque `EscribirNucleo` sólo
+                ' produce esta excepcion DESPUES de abrir y truncar, o sea siempre con `seToco = True`.
                 '
                 ' La divergencia es la correcta y por eso se declara en vez de disimularla:
-                '   · en `Escribir`/`GuardarConCopia` (ver el ⛔ de ContratoDelCuerpoException) el archivo se
-                '     CONSERVA, porque es la unidad entera: sus bytes son los que el cuerpo produjo y no hay
-                '     nada mas con que quedar consistente;
+                '   · en `Escribir`/`GuardarConCopia` (ver el ⛔ de ContratoDelCuerpoException) el archivo
+                '     se CONSERVA, porque es la unidad entera: sus bytes son los que el cuerpo produjo y
+                '     no hay nada mas con que quedar consistente;
                 '   · en un LOTE la unidad son N archivos y manda todo-o-nada ANTE EXCEPCIONES MANEJADAS
                 '     DENTRO DEL PROCESO (ver el contrato en la cabecera). Conservar el del violador del
-                '     contrato mientras sus hermanos se deshacen deja EXACTAMENTE el estado mezclado que el
-                '     lote existe para impedir — y encima uno cuya durabilidad no podemos sostener.
+                '     contrato mientras sus hermanos se deshacen deja EXACTAMENTE el estado mezclado que
+                '     el lote existe para impedir — y encima uno cuya durabilidad no podemos sostener.
                 ' Lo que NO cambia es el aviso: se sigue tirando con el mensaje del contrato, asi que el
                 ' llamador se entera de que lo que rompio fue el `leaveOpen`, no un fallo de disco.
-                _etapas.Add(New Etapa With {.Destino = destino, .Copia = If(copiaHecha, copia, ""), .Heredadas = heredadas})
+                etapaActual.RequiereRollback = seToco
                 DeshacerYTirar(ex.Message, ex)
             Catch ex As Exception
-                If seToco AndAlso Not existia Then Borrar(destino)
-                If copiaHecha Then
-                    ' Esta etapa vuelve primero, con la misma primitiva a prueba de ocultos que el resto.
-                    Try
-                        VolcarEncima(copia, destino, permitirOrigenVacio:=True)
-                        Borrar(copia)
-                        copiaHecha = False
-                    Catch
-                        ' No volvio: su copia se QUEDA. Se anota como etapa para que el informe la nombre.
-                        _etapas.Add(New Etapa With {.Destino = destino, .Copia = copia, .Heredadas = heredadas})
-                        DeshacerYTirar(MensajeCopiaViva(destino, copia), ex)
-                    End Try
-                End If
+                ' `seToco` sale en True desde el instante en que el destino pudo ABRIRSE. False ⇒ no se
+                ' pudo ni empezar (tomado, de solo lectura, sin permiso): el archivo del usuario esta
+                ' intacto y el rollback NO lo tiene que tocar. Su copia igual se limpia al resolver.
+                etapaActual.RequiereRollback = seToco
                 DeshacerYTirar(ex.Message, ex)
             End Try
-
-            _etapas.Add(New Etapa With {.Destino = destino, .Copia = If(copiaHecha, copia, ""), .Heredadas = heredadas})
         End Sub
 
         ''' <summary>BORRA un archivo COMO ETAPA DEL LOTE. Es la tercera operacion destructiva, y hasta acá
@@ -830,6 +856,12 @@ Public NotInheritable Class EscrituraEnElLugar
                 atributosLeidos = True
             Catch
             End Try
+            ' ⛔ SE GUARDA Y SE REAPLICA LA MASCARA, NO EL VALOR CRUDO. `GetAttributes` puede traer bits que
+            ' administra el filesystem —`Compressed` en un volumen comprimido, `SparseFile`, `ReparsePoint`—
+            ' que `SetAttributes` NO controla. Guardar el crudo hace que el rollback intente reponer un bit
+            ' que no puede, y que la verificacion posterior falle SIEMPRE: el usuario recibiria un error de
+            ' restauracion sobre un archivo que volvio perfecto. Ver `MascaraDeAtributosRestaurables`.
+            Dim atribsParaReponer = AtributosRestaurables(atributos)
 
             Dim copiaHecha As Boolean = False
             Dim causaCopia As String = ""
@@ -860,13 +892,32 @@ Public NotInheritable Class EscrituraEnElLugar
                                If(causaCopia = "", "", Environment.NewLine & causaCopia), Nothing)
             End If
 
+            ' ⛔⛔ LA ETAPA ENTRA APENAS SU COPIA ESTA ASEGURADA — ANTES DEL DIARIO Y ANTES DEL `Delete`.
+            ' Es EL MISMO GEMELO que en `Guardar`, y tenia el mismo agujero: `Registrar` PUEDE TIRAR, y con
+            ' el `_etapas.Add` alla abajo esa excepcion dejaba en disco una copia que no estaba en ninguna
+            ' lista — ni el rollback la conocia ni la limpieza la levantaba: respaldo HUERFANO al lado del
+            ' archivo del usuario, sin nada que lo explique. Medido en R5.
+            ' `RequiereRollback` arranca en False y pasa a True RECIEN cuando el `Delete` salio: mientras
+            ' sea False el archivo SIGUE en disco, asi que `Deshacer` no tiene nada que recrear y saltearlo
+            ' es lo correcto — pero la etapa igual esta, y por eso su copia se limpia al resolver.
+            Dim etapaActual As New Etapa With {
+                .Destino = destino,
+                .Copia = copia,
+                .Heredadas = heredadas,
+                .EsBorrado = True,
+                .Atributos = atribsParaReponer,
+                .RequiereRollback = False
+            }
+            _etapas.Add(etapaActual)
+
             ' ⛔ El borrado se anota ANTES de hacerlo, con su copia y sus atributos: si el proceso muere
             ' entre el Delete y el registro, el arranque siguiente no sabria que ese archivo existia.
-            If _diario IsNot Nothing Then _diario.Registrar(destino, copia, "borrar", atributos)
+            If _diario IsNot Nothing Then _diario.Registrar(destino, copia, "borrar", atribsParaReponer)
             Try
                 ' Un SOLO LECTURA no se deja borrar; los atributos originales ya quedaron anotados arriba.
                 LimpiarAtributos(destino)
                 File.Delete(destino)
+                etapaActual.RequiereRollback = True
             Catch ex As Exception
                 ' ⛔⛔ SI EL BORRADO FALLA, EL ARCHIVO SE QUEDA — Y TIENE QUE QUEDARSE COMO ESTABA. El
                 ' `LimpiarAtributos` de arriba ya le saco el OCULTO / SOLO LECTURA al archivo del USUARIO
@@ -881,13 +932,20 @@ Public NotInheritable Class EscrituraEnElLugar
                 Dim atributosDevueltos As Boolean = Not atributosLeidos    ' nada que devolver = nada que fallar
                 If atributosLeidos Then
                     Try
-                        File.SetAttributes(destino, atributos)
+                        File.SetAttributes(destino, atribsParaReponer)
                         atributosDevueltos = True
                     Catch
                     End Try
                 End If
 
-                Borrar(copia)          ' el archivo sigue ahi: su copia no aporta nada y no se deja colgada
+                ' ⛔⛔ LA COPIA NO SE BORRA ACA. Habia un `Borrar(copia)` con el argumento "el archivo sigue
+                ' ahi, su copia no aporta nada": el argumento es cierto sobre el ESTADO FINAL y falso sobre
+                ' el CAMINO. El diario ya registro este borrado con ESA copia y sigue en `en_curso`; entre
+                ' el `Borrar` y el `MarcarResuelto` hay una ventana en la que el diario promete restaurar
+                ' desde un respaldo que ya no existe — y si el proceso muere ahi, el arranque siguiente
+                ' encuentra la entrada y falla con "Backup missing". La copia se va donde se van todas:
+                ' en la limpieza, DESPUES de `MarcarResuelto`. Como esta etapa tiene RequiereRollback=False,
+                ' `Deshacer` no la toca y el informe queda vacio, asi que la limpieza corre igual.
                 ' ⛔ EL MENSAJE DICE LA VERDAD DE LAS DOS COSAS. Si los atributos volvieron, el texto de
                 ' siempre es cierto y alcanza. Si NO volvieron, el usuario tiene que enterarse de que su
                 ' archivo quedo distinto de como estaba, y de cual era el valor.
@@ -896,56 +954,142 @@ Public NotInheritable Class EscrituraEnElLugar
                                   $" It was also left WITHOUT its original attributes (it had: {atributos}).") &
                                Environment.NewLine & ex.Message, ex)
             End Try
-
-            _etapas.Add(New Etapa With {.Destino = destino, .Copia = copia, .Heredadas = heredadas,
-                                        .EsBorrado = True, .Atributos = atributos})
         End Sub
 
-        ''' <summary>El lote salio bien: recien ACA se borran las copias que tomo esta corrida, y se aplica
-        ''' la ley de heredadas de <see cref="GuardarConCopia"/> — una heredada se borra SOLO si esta
-        ''' corrida la PROBO byte por byte redundante.</summary>
+        ''' <summary>El lote salio bien. ⛔⛔ EL ORDEN ES EL PROTOCOLO, NO UN DETALLE:
+        ''' <c>MarcarResuelto → borrar copias → borrar diario</c>.
+        ''' <para>Antes se borraban las copias PRIMERO y el diario despues. Un corte en esa ventana dejaba
+        ''' un diario en `en_curso` con la mitad de sus copias ya borradas, y el arranque siguiente ofrecia
+        ''' "restaurar el estado anterior" de un guardado que en realidad estaba CONFIRMADO — restaurando
+        ''' las pocas copias que sobrevivieron sobre archivos nuevos: cosecha mixta, que es exactamente el
+        ''' daño que este lote existe para evitar. Con `resuelto` escrito ANTES, un corte en la limpieza
+        ''' solo reinicia la limpieza, y la restauracion no se ofrece nunca sobre algo ya resuelto.</para>
+        ''' <para>Se conserva la ley de heredadas de <see cref="GuardarConCopia"/>: una heredada se borra
+        ''' SOLO si esta corrida la PROBO byte por byte redundante — y la comparacion se hace ARRIBA,
+        ''' mientras las copias todavia existen.</para>
+        ''' <para>⛔ SI `MarcarResuelto` FALLA, LA EXCEPCION SE PROPAGA Y EL GUARDADO ENTERO SE DESHACE. Es
+        ''' deliberado y es ruidoso: `Confirmar` tira SIN poner `_confirmado`, asi que el `Dispose` del
+        ''' `Using` del llamador corre `Deshacer()` y devuelve los archivos. La alternativa —seguir adelante
+        ''' con un diario que no pudo pasar a `resuelto`— dejaria los destinos nuevos Y un diario `en_curso`
+        ''' con sus copias: el arranque siguiente ofreceria DESHACER un guardado que el usuario ya dio por
+        ''' bueno. Entre perder un guardado con aviso ahora y que se revierta solo la semana que viene, se
+        ''' elige lo primero.</para></summary>
         Public Sub Confirmar()
             If _confirmado Then Return
+
+            ' La comparacion va ANTES de borrar nada: necesita las copias vivas para poder probar la
+            ' redundancia byte por byte.
+            Dim heredadasRedundantes As New HashSet(Of String)(StringComparer.OrdinalIgnoreCase)
             For Each e In _etapas
-                If e.Copia = "" Then Continue For
-                Dim redundantes As New List(Of String)
+                If String.IsNullOrEmpty(e.Copia) Then Continue For
                 For Each h In e.Heredadas
-                    If MismoContenido(h, e.Copia) Then redundantes.Add(h)
-                Next
-                Borrar(e.Copia)
-                For Each h In redundantes
-                    Borrar(h)
+                    If MismoContenido(h, e.Copia) Then heredadasRedundantes.Add(h)
                 Next
             Next
-            ' ⛔ EL DIARIO SE CIERRA AL FINAL, despues de borrar las copias: si el proceso muere entre
-            ' medio, lo que sobrevive es un diario que ofrece recuperar un lote YA escrito —molesto—
-            ' en vez de copias sin diario que nadie sabe de donde salieron.
-            If _diario IsNot Nothing Then _diario.Cerrar()
+
+            ' Primero, durablemente: los destinos YA son el resultado final.
+            If _diario IsNot Nothing Then _diario.MarcarResuelto()
+
+            ' Recien ahora las copias dejan de hacer falta.
+            Dim sobrantes = LimpiarCopiasPropias()
+            For Each h In heredadasRedundantes
+                Borrar(h)
+            Next
+
+            ' ⛔ EL DIARIO SE BORRA SOLO SI NO QUEDO NINGUNA COPIA. Si alguna sobrevivio, el diario ya
+            ' `resuelto` se queda y el arranque siguiente retoma la limpieza — inofensiva, porque `resuelto`
+            ' le prohibe ofrecer restauracion.
+            If sobrantes.Count = 0 AndAlso _diario IsNot Nothing Then _diario.Cerrar()
             _confirmado = True
         End Sub
 
-        ''' <summary>⛔ NUNCA TIRA. Si el lote no se confirmo, deshace lo escrito en orden INVERSO y deja el
-        ''' informe en <see cref="InformeDeRestauracion"/>. Tirar desde acá taparia la excepcion que venia
-        ''' propagando —que es la causa que el usuario necesita—, asi que el camino que SI tira es el
+        ''' <summary>Borra las copias que tomo ESTE lote y devuelve las que NO se pudieron borrar.
+        ''' <para>Se deduplica por ruta: dos etapas sobre el mismo destino pueden compartir slot de copia, y
+        ''' borrar dos veces la misma ruta haria que la segunda vuelta la contara como sobrante.</para>
+        ''' <para>⛔ NO se le agrega un helper que ademas marque el diario. Sus dos unicos consumidores
+        ''' —<see cref="Confirmar"/> y <c>CerrarRollbackTerminadoSinTirar</c>— tienen politicas OPUESTAS de
+        ''' propagacion: uno TIRA y el otro NUNCA puede tirar. Unificarlos esconderia esa diferencia o
+        ''' generaria un parametro que solo uno usa.</para></summary>
+        Private Function LimpiarCopiasPropias() As List(Of String)
+            Dim sobrantes As New List(Of String)
+            Dim unicas = _etapas.Select(Function(e) e.Copia).
+                Where(Function(ruta) Not String.IsNullOrEmpty(ruta)).
+                Distinct(StringComparer.OrdinalIgnoreCase)
+            For Each copia In unicas
+                Borrar(copia)
+                If File.Exists(copia) Then sobrantes.Add(copia)
+            Next
+            Return sobrantes
+        End Function
+
+        ''' <summary>⛔ NUNCA TIRA. Si el lote no se confirmo, deshace lo escrito en orden INVERSO y deja
+        ''' el informe en <see cref="InformeDeRestauracion"/>. Tirar desde aca taparia la excepcion que
+        ''' venia propagando —que es la causa que el usuario necesita—, asi que el camino que SI tira es el
         ''' `Guardar` fallido. Este cubre el otro caso: que el llamador aborte por su cuenta entre
         ''' etapas.</summary>
         Public Sub Dispose() Implements IDisposable.Dispose
             If _dispuesto Then Return
             _dispuesto = True
             If _confirmado Then Return
+
             _InformeDeRestauracion = Deshacer()
-            ' ⛔ EL DIARIO SE VA SOLO SI TODO VOLVIO. Un informe vacio significa que el rollback EN
-            ' PROCESO dejo el disco como estaba: conservar el diario ofreceria en el arranque siguiente
-            ' 'recuperar' un estado que ya esta recuperado, y el usuario no tiene como saber que no hay
-            ' nada que hacer. Si hubo CAIDOS —o advertencias— el diario SE QUEDA: ahi si hay algo
-            ' pendiente que el arranque tiene que ofrecer.
-            If _diario IsNot Nothing AndAlso _InformeDeRestauracion = "" Then _diario.Cerrar()
+            ' ⛔ SI ALGO NO VOLVIO, NO SE TOCA NADA MAS. El diario sigue `en_curso` y sus copias siguen en
+            ' disco: son exactamente lo que el arranque siguiente necesita para ofrecerle al usuario lo que
+            ' este rollback no pudo hacer. Marcar resuelto aca seria declarar terminada una restauracion
+            ' incompleta.
+            If _InformeDeRestauracion <> "" Then Return
+
+            Dim aviso = CerrarRollbackTerminadoSinTirar()
+            If aviso <> "" Then _InformeDeRestauracion = aviso
         End Sub
+
+        ''' <summary>Cierra el ciclo del diario DESPUES de que <c>Deshacer</c> confirmo que TODOS los
+        ''' destinos volvieron. Mismo protocolo que <see cref="Confirmar"/> —resuelto, copias, diario—
+        ''' porque el estado del disco es igual de final: un rollback terminado tambien es una decision
+        ''' completa, y ofrecerlo de nuevo en el arranque siguiente pisaria lo que el usuario ya recupero.
+        ''' <para>⛔ NUNCA TIRA: sus dos llamadores corren MIENTRAS se propaga la excepcion original (el
+        ''' `Dispose` de un `Using` que se esta desenrollando, y `DeshacerYTirar`). Una excepcion desde aca
+        ''' TAPARIA esa causa, que es el dato que el usuario necesita. Lo que no se pudo hacer vuelve como
+        ''' TEXTO y se anexa al informe.</para>
+        ''' <para>Los tres avisos son distintos a proposito: "no se pudo marcar resuelto" (el arranque
+        ''' siguiente va a ofrecer restaurar algo YA restaurado), "quedaron respaldos" (hay archivos al lado
+        ''' de los suyos) y "quedo el diario" (inofensivo, se reintenta solo). Un solo mensaje generico
+        ''' mandaria al usuario a revisar la cosa equivocada.</para></summary>
+        Private Function CerrarRollbackTerminadoSinTirar() As String
+            Try
+                If _diario IsNot Nothing Then _diario.MarcarResuelto()
+            Catch ex As Exception
+                Return "Los archivos se restauraron, pero el diario de recuperacion no se pudo marcar " &
+                       "como resuelto: " & ex.Message
+            End Try
+
+            Dim sobrantes = LimpiarCopiasPropias()
+            If sobrantes.Count > 0 Then
+                Return "Los archivos se restauraron, pero estos respaldos no se pudieron borrar: " &
+                       String.Join(", ", sobrantes)
+            End If
+
+            If _diario IsNot Nothing AndAlso Not _diario.Cerrar() Then
+                Return "Los archivos se restauraron y sus respaldos se borraron, pero el diario de " &
+                       "recuperacion ya resuelto no se pudo eliminar. La limpieza se reintenta en el " &
+                       "proximo arranque."
+            End If
+            Return ""
+        End Function
 
         ''' <summary>Restaura en orden INVERSO. ⛔ SE INTENTAN TODAS: no se corta en la primera que falla,
         ''' porque cortar deja restauradas justo las ultimas y sin tocar las primeras — el estado mezclado
-        ''' que este lote existe para evitar. ⛔ Y LA COPIA DE UN ARCHIVO QUE NO VOLVIO NO SE BORRA JAMAS:
-        ''' es su unico ejemplar.</summary>
+        ''' que este lote existe para evitar.
+        ''' <para>⛔ EL ORDEN INVERSO NO ES ESTILO. Un lote puede tocar el MISMO destino mas de una vez
+        ''' (escribirlo y despues borrar su sidecar, o guardarlo dos veces en la misma cadena). Hacia
+        ''' adelante, la ultima copia que se vuelca es la MAS NUEVA y el archivo queda en el estado
+        ''' INTERMEDIO —el que tenia a mitad del guardado—, no en el que el usuario tenia antes de empezar.
+        ''' Hacia atras, la que manda al final es la primera copia tomada. Medido en `D3`.</para>
+        ''' <para>⛔⛔ Y ACA NO SE BORRA NINGUNA COPIA. Ni la del que no volvio —es su unico ejemplar— ni la
+        ''' del que si: mientras el diario siga en `en_curso`, sus copias son lo unico que un corte de luz
+        ''' deja para restaurar, y borrarlas durante el rollback abre una ventana en la que el diario
+        ''' promete recuperacion sobre respaldos que ya no estan. La limpieza es la ULTIMA fase del
+        ''' protocolo y vive en <c>CerrarRollbackTerminadoSinTirar</c>, despues de `MarcarResuelto`.</para></summary>
         Private Function Deshacer() As String
             Dim vueltos As New List(Of String)
             Dim caidos As New List(Of String)
@@ -958,6 +1102,13 @@ Public NotInheritable Class EscrituraEnElLugar
             For i = _etapas.Count - 1 To 0 Step -1
                 Dim e = _etapas(i)
 
+                ' ⛔ EL WAL PUEDE EXISTIR AUNQUE EL DESTINO NUNCA SE HAYA TOCADO. La etapa se anota
+                ' apenas queda escrita en el diario, antes de abrir el archivo; si la apertura fallo, el
+                ' destino sigue siendo el del usuario y volcarle la copia encima seria REESCRIBIRLO —
+                ' cambiandole el mtime y la identidad por un guardado que nunca ocurrio. La etapa se
+                ' conserva igual para que su copia se limpie al resolver el lote, pero no se restaura.
+                If Not e.RequiereRollback Then Continue For
+
                 ' ⛔ CREACION: el destino NO existia, asi que deshacerla es BORRARLO. Acá se hacia
                 ' `Continue For` —"no hay copia, no hay nada que restaurar"—, y eso dejaba EN DISCO todos
                 ' los archivos que el lote habia creado: un proyecto NUEVO que falla en la etapa 3 dejaba el
@@ -968,6 +1119,15 @@ Public NotInheritable Class EscrituraEnElLugar
                         Try
                             LimpiarAtributos(e.Destino)   ' un SOLO LECTURA no se deja borrar
                             File.Delete(e.Destino)
+                            ' ⛔ SE VERIFICA QUE SE HAYA IDO. `File.Delete` puede volver sin excepcion y
+                            ' dejar el archivo (borrado diferido: alguien lo tiene abierto con
+                            ' FILE_SHARE_DELETE). Sin este chequeo el rollback informaria "se quita" un
+                            ' archivo que sigue ahi, y el usuario cerraria el dialogo creyendo que su
+                            ' carpeta volvio a estar limpia.
+                            If File.Exists(e.Destino) Then
+                                Throw New IOException(
+                                    "El archivo creado por la transaccion fallida sigue existiendo.")
+                            End If
                             vueltos.Add(IO.Path.GetFileName(e.Destino) & " (creado, se quita)")
                         Catch
                             caidos.Add($"  · '{IO.Path.GetFileName(e.Destino)}' se creo en este guardado y " &
@@ -991,6 +1151,15 @@ Public NotInheritable Class EscrituraEnElLugar
                 End If
                 Try
                     VolcarEncima(e.Copia, e.Destino, permitirOrigenVacio:=True)
+                    ' ⛔ SE COMPRUEBAN LOS BYTES ANTES DE DECLARAR LA ETAPA RECUPERADA. Sin esto, `vueltos`
+                    ' afirmaba "volvio" con lo unico que sabia: que `VolcarEncima` no habia tirado. Un
+                    ' volcado corto —disco lleno a mitad, escritura parcial— pasa por ahi sin excepcion y
+                    ' deja el destino MEZCLADO; el informe lo daba por bueno y la copia quedaba como el
+                    ' unico ejemplar sin que nadie lo dijera. Un rollback que miente es peor que uno que
+                    ' falla.
+                    If Not MismoContenido(e.Copia, e.Destino) Then
+                        Throw New IOException("El destino restaurado no coincide con su respaldo.")
+                    End If
                     ' ⛔ BORRADO: el archivo se habia ido, asi que recrearlo NO alcanza con los bytes — hay
                     ' que devolverle SUS atributos. El respaldo paso por `LimpiarAtributos` (si no, la copia
                     ' de un OCULTO queda invisible y una de SOLO LECTURA no se puede borrar despues), asi
@@ -1005,15 +1174,27 @@ Public NotInheritable Class EscrituraEnElLugar
                     ' que ya no hace falta.
                     If e.EsBorrado Then
                         Try
-                            File.SetAttributes(e.Destino, e.Atributos)
+                            ' Mascara, no valor crudo: ver `MascaraDeAtributosRestaurables`. Y se VERIFICA,
+                            ' porque `SetAttributes` sobre un archivo que otro proceso tiene tomado puede
+                            ' volver sin efecto.
+                            Dim esperados = AtributosRestaurables(e.Atributos)
+                            File.SetAttributes(e.Destino, esperados)
+                            If AtributosRestaurables(File.GetAttributes(e.Destino)) <> esperados Then
+                                Throw New IOException("No se restauraron los atributos originales.")
+                            End If
                         Catch ex As Exception
                             advertencias.Add(
                                 $"  · '{IO.Path.GetFileName(e.Destino)}' recupero sus bytes, pero NO sus " &
                                 $"atributos originales ({e.Atributos}): {ex.Message}")
                         End Try
                     End If
+                    ' ⛔⛔ LA COPIA NO SE BORRA ACA. Antes se borraba "probada redundante", y eso rompia el
+                    ' protocolo del diario: mientras el diario siga en `en_curso`, sus copias son lo unico
+                    ' que un corte de luz deja para restaurar. Borrarlas durante el rollback abria una
+                    ' ventana en la que el diario prometia recuperacion sobre copias que ya no estaban.
+                    ' Las copias se van RECIEN despues de `MarcarResuelto`, en
+                    ' `CerrarRollbackTerminadoSinTirar`.
                     vueltos.Add(IO.Path.GetFileName(e.Destino))
-                    Borrar(e.Copia)              ' probada redundante: el destino ya tiene esos bytes
                 Catch
                     caidos.Add($"  · '{IO.Path.GetFileName(e.Destino)}' NO se pudo devolver; su version " &
                                $"anterior esta en '{IO.Path.GetFileName(e.Copia)}'")
@@ -1045,11 +1226,13 @@ Public NotInheritable Class EscrituraEnElLugar
             Return sb.ToString()
         End Function
 
+        ''' <summary>Deshace y RE-TIRA con la causa original. Mismo protocolo que el `Dispose`: si el
+        ''' rollback dejo algo afuera, el diario y las copias SE QUEDAN; si todo volvio, se cierra el ciclo
+        ''' y lo unico que puede pasar es que se anexe un aviso al mensaje.</summary>
         Private Sub DeshacerYTirar(causa As String, interna As Exception)
             Dim informe = Deshacer()
+            If informe = "" Then informe = CerrarRollbackTerminadoSinTirar()
             _InformeDeRestauracion = informe
-            ' Misma ley que el Dispose: si todo volvio, el diario no describe nada pendiente y se va.
-            If _diario IsNot Nothing AndAlso informe = "" Then _diario.Cerrar()
             _confirmado = True          ' ya se deshizo: el Dispose no lo tiene que volver a hacer
             Throw New IOException(causa & If(informe = "", "", Environment.NewLine & informe), interna)
         End Sub
