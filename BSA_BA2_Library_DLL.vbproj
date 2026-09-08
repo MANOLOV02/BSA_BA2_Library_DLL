@@ -10,6 +10,14 @@
     <Platforms>x86;x64</Platforms>
   </PropertyGroup>
 
+  <!-- Identidad que ve el usuario: Propiedades del archivo en Windows y el volcado de ensamblados
+       de un reporte de caida. El NUMERO no esta aca: sale del Directory.Build.props del repo. -->
+  <PropertyGroup>
+    <Product>Bethesda BSA / BA2 Library</Product>
+    <AssemblyTitle>Bethesda BSA / BA2 Library</AssemblyTitle>
+    <Description>Reader and writer for Bethesda BSA (SSE) and BA2 (FO4) archives.</Description>
+  </PropertyGroup>
+
   <ItemGroup>
     <None Remove="BSABA2.zip" />
   </ItemGroup>
