@@ -48,6 +48,15 @@
     <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
       <_Parameter1>BsaHashGate</_Parameter1>
     </AssemblyAttribute>
+    <!-- Tools/ModelInfoDerivationGate: cada entrada del bloque de Model Information de un record es
+         (hash del nombre, extension, hash de la carpeta) — el MISMO trio con el que un BA2 indexa. El
+         gate necesita `Ba2WriterCommon.Fo4PathHash` (Friend) para poder comparar lo que deriva del NIF
+         contra los bytes del record. Reimplementarlo dejaria DOS copias de la unica funcion que decide
+         si una entrada apunta al archivo correcto, y la del gate no tendria por que fallar cuando la de
+         la app falle. NADA se vuelve Public. -->
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>ModelInfoDerivationGate</_Parameter1>
+    </AssemblyAttribute>
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\DirectXTextWrapper\DirectXTexWrapper.vcxproj" />
