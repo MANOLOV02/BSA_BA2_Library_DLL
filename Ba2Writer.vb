@@ -53,8 +53,15 @@ Namespace BethesdaArchive.Core
         ''' minúscula. NO es el CRC32 zip estándar (init 0xFFFFFFFF + Not crc) que hace Crc32Bytes
         ''' para el diff de payload. Verificado 5/5 contra vanilla (barnacle/default/keys/materials/
         ''' gasolinecanister) y dirs anidados de Creation Club.
+        ''' <para>⛔ ES <b>Public</b> A PROPOSITO, y es la unica de este archivo que lo es. El mismo
+        ''' trio (hash del nombre, extension, hash de la carpeta) con el que un BA2 indexa es lo que
+        ''' escribe el bloque de Model Information de un record — o sea que esta funcion es una LEY
+        ''' COMPARTIDA entre el empaquetador de archives y el escritor de plugins. La alternativa era
+        ''' copiarla en `FO4_Base_Library`, y dos copias de la funcion que decide si una entrada
+        ''' apunta al archivo correcto es exactamente como se separan. No expone estado ni nada del
+        ''' writer: es pura sobre un string.</para>
         ''' </summary>
-        Friend Shared Function Fo4PathHash(text As String) As UInteger
+        Public Shared Function Fo4PathHash(text As String) As UInteger
             ' ⛔ NO `Encoding.ASCII`: reemplaza TODO byte > 127 por `?` (0x3F), así que un nombre con
             ' acento se hashea como si fuera otro nombre — mientras la TABLA DE NOMBRES del archive se
             ' escribe en UTF-8 (`Public Property Encoding As Encoding = Encoding.UTF8`). El canon hashea
