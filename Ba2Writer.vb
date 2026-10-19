@@ -350,6 +350,14 @@ Namespace BethesdaArchive.Core
     Public NotInheritable Class Ba2WriterDX10
         Public Shared Event Writed()
 
+        ''' <summary>The tile byte written for an entry: its own (r19c-05). DEBUG ONLY: Ba2GateMutants "ba2-writer-tile8" writes 8.</summary>
+        Private Shared Function TileModeToWrite(tile As Byte) As Byte
+#If DEBUG Then
+            If Ba2GateMutants.IsOn("ba2-writer-tile8") Then Return 8
+#End If
+            Return tile
+        End Function
+
         Public NotInheritable Class Options
             Public Property Encoding As Encoding = Encoding.UTF8
             ' FO4 admite v1, v7 y v8; default NG:
@@ -458,7 +466,7 @@ Namespace BethesdaArchive.Core
                     .Dx10_MipCount = CByte(ve.MipCount),
                     .Dx10_DxgiFormatU8 = CByte(ve.DxgiFormat And &HFF),
                     .Dx10_Flags = If(ve.IsCubemap, CByte(1), CByte(0)),
-                    .Dx10_TileMode = CByte(8), ' como en el C++
+                    .Dx10_TileMode = TileModeToWrite(ve.TileMode), ' the entry's (8 unless an opened archive brought another: r19c-05)
                     .Chunk_MipFirst = 0US,
                     .Chunk_MipLast = CUShort(ve.MipCount - 1)
                 }

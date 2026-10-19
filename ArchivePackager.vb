@@ -1579,7 +1579,7 @@ Namespace BethesdaArchive.Core
                         Try
                             raw = reader.ExtractCompressedPayload(ae.Index)
                         Catch ex As NotSupportedException
-                            ' Layout we can't replay verbatim (multi-chunk BA2, non-default tile mode,
+                            ' Layout we can't replay verbatim (multi-chunk BA2,
                             ' BSA edge cases). Treat as "changed" — forces a rewrite, the safe direction.
                             changedAny = True
                             Continue For
@@ -1777,6 +1777,7 @@ Namespace BethesdaArchive.Core
                 ve.DxgiFormat = ps.DxgiFormat
                 ve.IsCubemap = ps.IsCubemap
                 ve.Faces = ps.Faces
+                ve.TileMode = ps.TileMode
             End If
             Return ve
         End Function
@@ -1819,6 +1820,7 @@ Namespace BethesdaArchive.Core
                 ve.DxgiFormat = raw.DxgiFormat
                 ve.IsCubemap = raw.IsCubemap
                 ve.Faces = raw.Faces
+                ve.TileMode = raw.TileMode
             End If
             Return ve
         End Function

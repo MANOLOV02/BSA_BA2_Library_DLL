@@ -57,6 +57,21 @@
     <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
       <_Parameter1>ModelInfoDerivationGate</_Parameter1>
     </AssemblyAttribute>
+    <!-- Item 3 oracles (19-oct-2026): the DEBUG-only Ba2GateMutants is set by the gates' one entry point,
+         Fo4GBufferConstants.SetGateMutant (FO4_Base_Library; user decision "una sola entrada, dos switches"), by ParityGate's BA2
+         gates and by Ba2ManagerSaveGate H4 (which does not reference FO4_Base_Library). -->
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>FO4_Base_Library</_Parameter1>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>Ba2_Bsa_Manager</_Parameter1>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>ParityGate</_Parameter1>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>Ba2ManagerSaveGate</_Parameter1>
+    </AssemblyAttribute>
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\DirectXTextWrapper\DirectXTexWrapper.vcxproj" />

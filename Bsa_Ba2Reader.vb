@@ -9,6 +9,19 @@ Imports K4os.Compression.LZ4.Streams
 ' ======== API pública ========
 Namespace BethesdaArchive.Core
 
+#If DEBUG Then
+    ''' <summary>DEBUG ONLY: the directed mutants of the BA2 library's gates (ParityGate ba2-extract-prefix, Ba2ManagerSaveGate H4), the
+    ''' library's one switch - it cannot see FO4_Base_Library's (Fo4GBufferConstants.GateMutantOn): the dependency goes the other way.
+    ''' Names: "ba2-prefix-first-chunk-only", "ba2-prefix-dx10-skip-magic", "bsa-prefix-uncut" (ExtractPrefix), "ba2-writer-tile8"
+    ''' (Ba2WriterDX10), "ba2-payloadsource-throws" (GetPayloadSource). Nothing = the library as it is. A Release build has no branch.</summary>
+    Friend Module Ba2GateMutants
+        Friend Name As String = Nothing
+        Friend Function IsOn(n As String) As Boolean
+            Return String.Equals(Name, n, StringComparison.Ordinal)
+        End Function
+    End Module
+#End If
+
     ''' <summary>Techo del pre-alloc del MemoryStream de extraccion. Cota del FORMATO, no de la maquina:
     ''' ninguna textura de FO4/SSE se acerca (4096x4096 BC7 con mips ~22 MB). Por encima de esto el
     ''' `DecompressedSize` del header no es creible y se deja crecer el stream solo.</summary>
@@ -45,11 +58,19 @@ Namespace BethesdaArchive.Core
             Return _impl.ExtractByIndex(index)
         End Function
 
+        ''' <summary>The first <paramref name="count"/> bytes of an entry's file (fewer when it is shorter), decompressing no more
+        ''' than the format lets: a BA2 GNRL zlib chunk inflates only those bytes; a BA2 DX10 entry and a BSA entry are extracted
+        ''' whole and cut.</summary>
+        Public Function ExtractPrefix(index As Integer, count As Integer) As Byte()
+            If index < 0 OrElse index >= _entries.Count Then Throw New ArgumentOutOfRangeException(NameOf(index))
+            Return _impl.ExtractPrefixByIndex(index, count)
+        End Function
+
         ''' <summary>
         ''' Returns the raw compressed payload of an entry without decompressing it. Intended for
         ''' stream-copy scenarios (e.g. WM Pack incremental rewrite reusing unchanged entries from
         ''' a previous archive). Throws NotSupportedException if the source entry has a layout the
-        ''' caller cannot replay verbatim (e.g. multi-chunk BA2, non-default tile mode).
+        ''' caller cannot replay verbatim (e.g. multi-chunk BA2; the tile byte travels in RawCompressedEntry.TileMode).
         ''' </summary>
         Public Function ExtractCompressedPayload(index As Integer) As RawCompressedEntry
             If index < 0 OrElse index >= _entries.Count Then Throw New ArgumentOutOfRangeException(NameOf(index))
@@ -120,6 +141,10 @@ Namespace BethesdaArchive.Core
         Public Property Ba2DirHash As UInteger
         Public Property BsaFileHash As ULong
         Public Property BsaDirHash As ULong
+        ''' <summary>The texture record of a BA2 DX10 entry, verbatim (parsed by Open(), no extra I/O); Nothing for GNRL and BSA
+        ''' entries. Fallout4.exe copies these 8 bytes as they are into the texture's descriptor (0x1417CCB9D..CBB7 -&gt;
+        ''' 0x14183F680 -&gt; 0x14183E680; RE_FO4_TEXTURE_CREATION_2026-10-19 1.2).</summary>
+        Public Property Dx10Record As Ba2TextureRecord?
         Public ReadOnly Property FullPath As String
             Get
                 If String.IsNullOrEmpty(Directory) Then Return FileName
@@ -128,10 +153,24 @@ Namespace BethesdaArchive.Core
         End Property
     End Class
 
+    ''' <summary>The 8-byte texture record of a BA2 DX10 file entry, after its 16-byte common header: height (u16), width (u16),
+    ''' mip count (u8), DXGI format (u8), flags (u8, bit 0 = cube), tile mode (u8) (Ba2Impl.Open). Fallout4.exe reads the same
+    ''' qword (0x1417CCB31..CB72) and ignores the tile mode (0x14183E6C2 writes 0 over it).</summary>
+    Public Structure Ba2TextureRecord
+        Public Height As UShort
+        Public Width As UShort
+        Public MipCount As Byte
+        Public DxgiFormat As Byte
+        Public Flags As Byte
+        Public TileMode As Byte
+    End Structure
+
     Friend Interface IArchiveImpl
         Inherits IDisposable
         Function ListEntries() As List(Of ArchiveEntry)
         Function ExtractByIndex(index As Integer) As Byte()
+        ''' <summary>The first count bytes of the entry's file (fewer when it is shorter).</summary>
+        Function ExtractPrefixByIndex(index As Integer, count As Integer) As Byte()
         Function ExtractRawByIndex(index As Integer) As RawCompressedEntry
         Function GetPayloadSourceByIndex(index As Integer) As PayloadStreamSource
         ''' <summary>BA2 header version (1/2/3/7/8) for BA2 archives; Nothing for BSA (whose v105
@@ -567,6 +606,15 @@ Namespace BethesdaArchive.Core
             Return outData
         End Function
 
+        ''' <summary>BSA: the file is compressed as one block (zlib / LZ4 frame), so it is extracted whole and cut.</summary>
+        Public Function ExtractPrefixByIndex(index As Integer, count As Integer) As Byte() Implements IArchiveImpl.ExtractPrefixByIndex
+            Dim all = ExtractByIndex(index)
+#If DEBUG Then
+            If Ba2GateMutants.IsOn("bsa-prefix-uncut") Then Return all
+#End If
+            Return If(all.Length <= count, all, all.AsSpan(0, count).ToArray())
+        End Function
+
         Public Function ExtractRawByIndex(index As Integer) As RawCompressedEntry Implements IArchiveImpl.ExtractRawByIndex
             Dim r = _records(index)
 
@@ -767,56 +815,83 @@ Namespace BethesdaArchive.Core
 
                 Using ms As New MemoryStream(CInt(capacidad))
                     For Each ch In ordered
-
-                        If CLng(ch.Offset) < 0 OrElse CLng(ch.Offset) >= fs.Length Then
-                            Throw New InvalidDataException($"BA2.GNRL: offset fuera de rango (offset={ch.Offset}).")
-                        End If
-                        fs.Position = CLng(ch.Offset)
-
-                        Dim isComp As Boolean = (ch.CompressedSize <> 0UI)
-                        Dim needUL As ULong = If(isComp, CULng(ch.CompressedSize), CULng(ch.DecompressedSize))
-                        If needUL > CULng(Integer.MaxValue) Then
-                            Throw New InvalidDataException($"BA2.GNRL: tamaño de chunk excede Int32 (need={needUL}).")
-                        End If
-                        Dim need As Integer = CInt(needUL)
-                        ' Verificar el rango completo [Offset, Offset+need) (no solo el inicio) en Long
-                        ' para no leer fuera del archivo si el header trae un tamaño corrupto.
-                        If CLng(ch.Offset) + CLng(need) > fs.Length Then
-                            Throw New InvalidDataException($"BA2.GNRL: chunk excede el archivo (offset={ch.Offset}, need={need}).")
-                        End If
-
-                        Dim packed As Byte() = If(need > 0, New Byte(need - 1) {}, Array.Empty(Of Byte)())
-                        If need > 0 Then ReadExact(fs, packed, 0, need)
-
-                        Dim outChunk As Byte()
-                        If isComp Then
-                            If hdr.Version >= 3UI AndAlso hdr.V3_Compression = 3UI Then
-                                ' LZ4
-                                outChunk = Lz4Strict.Lz4DecompressStrict(packed, CInt(ch.DecompressedSize))
-                            Else
-                                ' zlib/deflate
-                                outChunk = ZlibStrict.ZlibDecompressStrict(packed, CInt(ch.DecompressedSize))
-                            End If
-                        Else
-                            outChunk = packed
-                        End If
-                        If isComp AndAlso ch.DecompressedSize = 0UI Then
-                            Throw New InvalidDataException("BA2.GNRL: chunk comprimido con DecompressedSize=0 no es válido.")
-                        End If
-                        If ch.DecompressedSize > 0UI AndAlso outChunk.Length <> CInt(ch.DecompressedSize) Then
-                            ' ajustar o validar
-                            If outChunk.Length < CInt(ch.DecompressedSize) Then
-                                Throw New InvalidDataException($"BA2.GNRL: tamaño descomprimido menor al esperado (got={outChunk.Length}, exp={ch.DecompressedSize}).")
-                            End If
-                            Array.Resize(outChunk, CInt(ch.DecompressedSize))
-                        End If
-
+                        Dim outChunk = ReadChunk(fs, hdr, ch, Nothing)
                         ms.Write(outChunk, 0, outChunk.Length)
-
                     Next
 
                     Return ms.ToArray()
                 End Using
+            End Function
+
+            ''' <summary>The first <paramref name="count"/> bytes of the file (fewer when it is shorter), decompressing no more
+            ''' than them where the codec allows: the chunks in file order, each one only as far as the prefix needs (a zlib chunk
+            ''' stops at the bytes asked, ZlibStrict; an LZ4 block decodes whole, Lz4Strict has no partial decode).</summary>
+            Public Function ExtractPrefix(fs As Stream, hdr As Ba2Header, count As Integer) As Byte()
+                If Chunks Is Nothing OrElse Chunks.Count = 0 OrElse count <= 0 Then Return Array.Empty(Of Byte)()
+                Using ms As New MemoryStream(count)
+                    For Each ch In Chunks.OrderBy(Function(c) c.Offset)
+                        Dim left = count - CInt(ms.Length)
+                        If left <= 0 Then Exit For
+                        Dim outChunk = ReadChunk(fs, hdr, ch, left)
+                        ms.Write(outChunk, 0, Math.Min(left, outChunk.Length))
+#If DEBUG Then
+                        If Ba2GateMutants.IsOn("ba2-prefix-first-chunk-only") Then Exit For
+#End If
+                    Next
+                    Return ms.ToArray()
+                End Using
+            End Function
+
+            ''' <summary>One chunk of the file, decompressed: whole (<paramref name="upTo"/> Nothing) or its first upTo bytes. The
+            ''' one reader of a GNRL chunk (Extract, ExtractPrefix): offset and range checked against the file, the decompressed
+            ''' size exact (ZlibStrict / Lz4Strict).</summary>
+            Private Shared Function ReadChunk(fs As Stream, hdr As Ba2Header, ch As Chunk, upTo As Integer?) As Byte()
+                If CLng(ch.Offset) < 0 OrElse CLng(ch.Offset) >= fs.Length Then
+                    Throw New InvalidDataException($"BA2.GNRL: offset fuera de rango (offset={ch.Offset}).")
+                End If
+                fs.Position = CLng(ch.Offset)
+
+                Dim isComp As Boolean = (ch.CompressedSize <> 0UI)
+                Dim needUL As ULong = If(isComp, CULng(ch.CompressedSize), CULng(ch.DecompressedSize))
+                If needUL > CULng(Integer.MaxValue) Then
+                    Throw New InvalidDataException($"BA2.GNRL: tamaño de chunk excede Int32 (need={needUL}).")
+                End If
+                Dim need As Integer = CInt(needUL)
+                ' Verificar el rango completo [Offset, Offset+need) (no solo el inicio) en Long
+                ' para no leer fuera del archivo si el header trae un tamaño corrupto.
+                If CLng(ch.Offset) + CLng(need) > fs.Length Then
+                    Throw New InvalidDataException($"BA2.GNRL: chunk excede el archivo (offset={ch.Offset}, need={need}).")
+                End If
+                If isComp AndAlso ch.DecompressedSize = 0UI Then
+                    Throw New InvalidDataException("BA2.GNRL: chunk comprimido con DecompressedSize=0 no es válido.")
+                End If
+                ' What this call returns: the whole chunk, or its first upTo bytes; an uncompressed chunk is read only that far.
+                Dim want As Integer = If(upTo.HasValue, CInt(Math.Min(CLng(upTo.Value), CLng(ch.DecompressedSize))), CInt(ch.DecompressedSize))
+                If Not isComp AndAlso upTo.HasValue Then need = Math.Min(need, want)
+
+                Dim packed As Byte() = If(need > 0, New Byte(need - 1) {}, Array.Empty(Of Byte)())
+                If need > 0 Then ReadExact(fs, packed, 0, need)
+
+                Dim outChunk As Byte()
+                If isComp Then
+                    If hdr.Version >= 3UI AndAlso hdr.V3_Compression = 3UI Then
+                        ' LZ4
+                        outChunk = Lz4Strict.Lz4DecompressStrict(packed, CInt(ch.DecompressedSize))
+                    Else
+                        ' zlib/deflate: inflates exactly 'want' bytes (the whole chunk without upTo)
+                        outChunk = ZlibStrict.ZlibDecompressStrict(packed, want)
+                    End If
+                Else
+                    outChunk = packed
+                End If
+                If want > 0 AndAlso outChunk.Length <> want Then
+                    ' ajustar o validar
+                    If outChunk.Length < want Then
+                        Throw New InvalidDataException($"BA2.GNRL: tamaño descomprimido menor al esperado (got={outChunk.Length}, exp={want}).")
+                    End If
+                    Array.Resize(outChunk, want)
+                End If
+                Return outChunk
             End Function
 
             Public Overrides Function ExtractRaw(fs As Stream, hdr As Ba2Header) As RawCompressedEntry
@@ -891,9 +966,10 @@ Namespace BethesdaArchive.Core
                     Return Array.Empty(Of Byte)()
                 End If
 
-                If TileMode <> 8 Then
-                    Throw New NotSupportedException($"BA2.DX10: TileMode={TileMode} no soportado (requiere destileo).")
-                End If
+                ' TileMode is NOT read here: Fallout4.exe writes 0 over the record's tile byte before it builds the texture
+                ' (0x14183E6C2; RE_FO4_TEXTURE_CREATION_2026-10-19 1.2) and uploads the chunks as they are, so a record with
+                ' TileMode <> 8 is a texture the game draws from the same bytes. (A re-pack keeps the byte: ArchiveEntry.Dx10Record,
+                ' RawCompressedEntry / PayloadStreamSource.TileMode -> VirtualEntry.TileMode; r19c-05.)
 
                 ' El encode vive en UN solo lugar (Dx10Importer.EncodeDdsHeader) porque lo necesita
                 ' tambien quien extrae al disco una fila ya despojada — ver el docstring de esa funcion.
@@ -987,9 +1063,7 @@ Namespace BethesdaArchive.Core
                     Throw New NotSupportedException(
                         $"BA2.DX10: ExtractCompressedPayload requires single-chunk entries (got {If(Chunks Is Nothing, 0, Chunks.Count)}).")
                 End If
-                If TileMode <> 8 Then
-                    Throw New NotSupportedException($"BA2.DX10: ExtractCompressedPayload requires TileMode=8 (got {TileMode}).")
-                End If
+                ' The tile byte travels with the payload (RawCompressedEntry.TileMode) and the writer keeps it (r19c-05).
 
                 Dim ch = Chunks(0)
                 If CLng(ch.Offset) < 0 OrElse CLng(ch.Offset) >= fs.Length Then
@@ -1023,7 +1097,8 @@ Namespace BethesdaArchive.Core
                     .MipCount = CInt(If(MipCount = 0, 1, MipCount)),
                     .DxgiFormat = CInt(DxgiFormatU8),
                     .IsCubemap = isCube,
-                    .Faces = If(isCube, 6, 1)
+                    .Faces = If(isCube, 6, 1),
+                    .TileMode = TileMode
                 }
             End Function
 
@@ -1183,6 +1258,7 @@ Namespace BethesdaArchive.Core
                 ' chunk headers during Open(). Zero extra I/O.
                 Dim decomp As Long = 0
                 Dim nameHash As UInteger = 0UI, dirHash As UInteger = 0UI
+                Dim record As Ba2TextureRecord? = Nothing
                 Dim eg = TryCast(e, EntryGNRL)
                 If eg IsNot Nothing Then
                     For Each ch In eg.Chunks
@@ -1196,6 +1272,8 @@ Namespace BethesdaArchive.Core
                             decomp += CLng(ch.DecompressedSize)
                         Next
                         nameHash = ed.HashFile : dirHash = ed.HashDir
+                        record = New Ba2TextureRecord With {.Height = ed.Height, .Width = ed.Width, .MipCount = ed.MipCount,
+                                                            .DxgiFormat = ed.DxgiFormatU8, .Flags = ed.Flags, .TileMode = ed.TileMode}
                     End If
                 End If
                 list.Add(New ArchiveEntry With {
@@ -1204,7 +1282,8 @@ Namespace BethesdaArchive.Core
                     .FileName = e.FileName,
                     .DecompressedSize = decomp,
                     .Ba2NameHash = nameHash,
-                    .Ba2DirHash = dirHash
+                    .Ba2DirHash = dirHash,
+                    .Dx10Record = record
                 })
             Next
             Return list
@@ -1212,6 +1291,16 @@ Namespace BethesdaArchive.Core
 
         Public Function ExtractByIndex(index As Integer) As Byte() Implements IArchiveImpl.ExtractByIndex
             Return _entries(index).Extract(_fs, _hdr)
+        End Function
+
+        Public Function ExtractPrefixByIndex(index As Integer, count As Integer) As Byte() Implements IArchiveImpl.ExtractPrefixByIndex
+            Dim g = TryCast(_entries(index), EntryGNRL)
+            If g IsNot Nothing Then Return g.ExtractPrefix(_fs, _hdr, count)
+            Dim all = _entries(index).Extract(_fs, _hdr)        ' DX10: the header its record rebuilds + the chunks, cut
+#If DEBUG Then
+            If Ba2GateMutants.IsOn("ba2-prefix-dx10-skip-magic") AndAlso all.Length >= 4 Then all = all.AsSpan(4).ToArray()
+#End If
+            Return If(all.Length <= count, all, all.AsSpan(0, count).ToArray())
         End Function
 
         Public Function ExtractRawByIndex(index As Integer) As RawCompressedEntry Implements IArchiveImpl.ExtractRawByIndex
@@ -1247,9 +1336,12 @@ Namespace BethesdaArchive.Core
                     Throw New NotSupportedException(
                         $"BA2.DX10: GetPayloadSource requires single-chunk entries (got {If(ed.Chunks Is Nothing, 0, ed.Chunks.Count)}).")
                 End If
-                If ed.TileMode <> 8 Then
-                    Throw New NotSupportedException($"BA2.DX10: GetPayloadSource requires TileMode=8 (got {ed.TileMode}).")
+                ' The tile byte travels with the payload (PayloadStreamSource.TileMode) and the writer keeps it (r19c-05).
+#If DEBUG Then
+                If Ba2GateMutants.IsOn("ba2-payloadsource-throws") AndAlso ed.TileMode <> 8 Then
+                    Throw New NotSupportedException($"BA2.DX10: GetPayloadSource requires TileMode=8 (got {ed.TileMode}) (mutant)")
                 End If
+#End If
                 Dim ch = ed.Chunks(0)
                 Dim isComp As Boolean = (ch.CompressedSize <> 0UI)
                 Dim isCube As Boolean = ((ed.Flags And 1) <> 0)
@@ -1266,7 +1358,8 @@ Namespace BethesdaArchive.Core
                     .MipCount = CInt(If(ed.MipCount = 0, CByte(1), ed.MipCount)),
                     .DxgiFormat = CInt(ed.DxgiFormatU8),
                     .IsCubemap = isCube,
-                    .Faces = If(isCube, 6, 1)
+                    .Faces = If(isCube, 6, 1),
+                    .TileMode = ed.TileMode
                 }
             End If
 

@@ -25,6 +25,9 @@ Namespace BethesdaArchive.Core
         Public Property MipCount As Integer
         Public Property IsCubemap As Boolean
         Public Property Faces As Integer
+        ''' <summary>The DX10 record's tile byte. 8 is what this library always wrote; an archive opened with another value keeps
+        ''' it on save (user decision r19c-05, 19-oct-2026: "open and keep the byte"). Fallout4.exe ignores it (0x14183E6C2).</summary>
+        Public Property TileMode As Byte = 8
 
         ' CRC32 of the logical (decompressed) Data. Used by callers (e.g. Wardrobe Pack) for cheap
         ' diff against an existing archive; writers do NOT consume this field.
@@ -86,6 +89,9 @@ Namespace BethesdaArchive.Core
         Public Property DxgiFormat As Integer
         Public Property IsCubemap As Boolean
         Public Property Faces As Integer
+        ''' <summary>The DX10 record's tile byte. 8 is what this library always wrote; an archive opened with another value keeps
+        ''' it on save (user decision r19c-05, 19-oct-2026: "open and keep the byte"). Fallout4.exe ignores it (0x14183E6C2).</summary>
+        Public Property TileMode As Byte = 8
     End Class
 
     ''' <summary>
@@ -110,6 +116,9 @@ Namespace BethesdaArchive.Core
         Public Property DxgiFormat As Integer
         Public Property IsCubemap As Boolean
         Public Property Faces As Integer
+        ''' <summary>The DX10 record's tile byte. 8 is what this library always wrote; an archive opened with another value keeps
+        ''' it on save (user decision r19c-05, 19-oct-2026: "open and keep the byte"). Fallout4.exe ignores it (0x14183E6C2).</summary>
+        Public Property TileMode As Byte = 8
     End Class
 
     ' ⛔ DEMOTADO A Friend: `ArchiveChangeSet`/`ArchiveHandle`/`MultiArchiveEditor`/`OpenMany` no tienen
