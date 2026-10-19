@@ -17,7 +17,14 @@ Namespace BethesdaArchive.Core
     Friend Module Ba2GateMutants
         Friend Name As String = Nothing
         Friend Function IsOn(n As String) As Boolean
-            Return String.Equals(Name, n, StringComparison.Ordinal)
+            Return Matches(Name, n)
+        End Function
+        ''' <summary>THE one reading of a mutant switch, shared by this library and FO4_Base_Library's GateMutantOn: the switch holds
+        ''' one name or several joined by '+' ("a+b": both on).</summary>
+        Friend Function Matches(switchValue As String, n As String) As Boolean
+            If switchValue Is Nothing Then Return False
+            If String.Equals(switchValue, n, StringComparison.Ordinal) Then Return True
+            Return switchValue.IndexOf("+"c) >= 0 AndAlso Array.IndexOf(switchValue.Split("+"c), n) >= 0
         End Function
     End Module
 #End If
